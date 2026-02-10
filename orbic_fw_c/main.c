@@ -13,6 +13,11 @@
 // BearSSL - statically linked TLS library
 #include "bearssl.h"
 
+// Device-specific configuration (can be overridden via -include)
+#ifdef DEVICE_M7350
+#include "device_config.h"
+#endif
+
 #include "clients.h"
 #include "gps.h"
 #include "log.h"
@@ -22,7 +27,9 @@
 
 #define PORT 8443 // HTTPS port (non-standard to avoid Verizon captive portal)
 #define BUFFER_SIZE 8192
+#ifndef MODEM_PORT
 #define MODEM_PORT "/dev/smd8"
+#endif
 
 // BearSSL context and buffers
 static br_ssl_server_context sc;
@@ -49,13 +56,6 @@ static int sock_read(void *ctx, unsigned char *buf, size_t len) {
   ssize_t rlen = read(fd, buf, len);
   if (rlen <= 0)
     return -1;
-
-  // Debug: Print first 5 bytes to diagnose TLS issues
-  if (rlen >= 5) {
-    fprintf(stderr, "RX(%zd): %02x %02x %02x %02x %02x\n", rlen, buf[0], buf[1],
-            buf[2], buf[3], buf[4]);
-  }
-
   return (int)rlen;
 }
 
@@ -662,11 +662,9 @@ void handle_client(br_sslio_context *ioc) {
       body + o,
       "<html><head><meta charset='UTF-8'><title>DagShell</title>"
       "<style>"
-      "@import "
-      "url('https://fonts.googleapis.com/"
-      "css2?family=Fira+Code:wght@400;700&display=swap');"
-      "*{box-sizing:border-box;}body{font-family:'Fira "
-      "Code',monospace;background:#0a0a0a;color:#0f0;margin:0;padding:20px;}"
+      "*{box-sizing:border-box;}body{font-family:'Courier "
+      "New',Courier,monospace;"
+      "background:#0a0a0a;color:#0f0;margin:0;padding:20px;}"
       ".scan{position:fixed;top:0;left:0;width:100%%;height:100%%;pointer-"
       "events:none;background:repeating-linear-gradient(0deg,rgba(0,0,0,0.1),"
       "rgba(0,0,0,0.1) 1px,transparent 1px,transparent 2px);z-index:999;}"
@@ -807,25 +805,38 @@ void handle_client(br_sslio_context *ioc) {
     else
       snprintf(uptime_str, sizeof(uptime_str), "%dm", up_mins);
 
-    // Get signal strength (AT+CSQ returns 0-31 scale)
-    char csq_resp[128] = "";
-    send_at_command("AT+CSQ", csq_resp, sizeof(csq_resp));
-    int signal_raw = 0;
-    char *csq_ptr = strstr(csq_resp, "+CSQ:");
-    if (csq_ptr)
-      signal_raw = atoi(csq_ptr + 6);
-    int signal_pct =
-        (signal_raw > 0 && signal_raw <= 31) ? (signal_raw * 100 / 31) : 0;
-    int signal_dbm =
-        (signal_raw > 0 && signal_raw <= 31) ? (-113 + signal_raw * 2) : 0;
+    // Cached signal/cell data (refreshed every 30s to avoid blocking modem)
+    static time_t last_home_cache = 0;
+    static int cached_signal_pct = 0, cached_signal_dbm = 0;
+    static int cached_client_count = 0;
+    static char cached_mcc[8] = "", cached_mnc[8] = "";
+    static char cached_lac[16] = "", cached_cid[16] = "";
 
-    // Get client count
-    clients_update();
-    int client_count = clients_get_count();
-
-    // Get cell tower info
+    time_t now_home = time(NULL);
+    if (now_home - last_home_cache >= 30) {
+      char csq_resp[128] = "";
+      send_at_command("AT+CSQ", csq_resp, sizeof(csq_resp));
+      int signal_raw = 0;
+      char *csq_ptr = strstr(csq_resp, "+CSQ:");
+      if (csq_ptr)
+        signal_raw = atoi(csq_ptr + 6);
+      cached_signal_pct =
+          (signal_raw > 0 && signal_raw <= 31) ? (signal_raw * 100 / 31) : 0;
+      cached_signal_dbm =
+          (signal_raw > 0 && signal_raw <= 31) ? (-113 + signal_raw * 2) : 0;
+      clients_update();
+      cached_client_count = clients_get_count();
+      gps_get_cell_info(cached_mcc, cached_mnc, cached_lac, cached_cid, 16);
+      last_home_cache = now_home;
+    }
+    int signal_pct = cached_signal_pct;
+    int signal_dbm = cached_signal_dbm;
+    int client_count = cached_client_count;
     char mcc[8], mnc[8], lac[16], cid[16];
-    gps_get_cell_info(mcc, mnc, lac, cid, 16);
+    strncpy(mcc, cached_mcc, sizeof(mcc));
+    strncpy(mnc, cached_mnc, sizeof(mnc));
+    strncpy(lac, cached_lac, sizeof(lac));
+    strncpy(cid, cached_cid, sizeof(cid));
 
     // Get data usage from /proc/net/dev - check multiple interfaces
     unsigned long rx_bytes = 0, tx_bytes = 0;
@@ -1002,19 +1013,35 @@ void handle_client(br_sslio_context *ioc) {
                 "target='_blank'>[Open Orbic Inbox]</a></p></div>",
                 at_response);
   } else if (strcmp(page, "tools") == 0) {
-    // --- Enhanced Cell/IMSI Info ---
+    // --- Enhanced Cell/IMSI Info (cached for 30s to avoid blocking modem) ---
+    static time_t last_tools_cache = 0;
+    static char c_cops[256] = "", c_creg[256] = "", c_csq[128] = "";
+    static char c_cgsn[128] = "", c_cimi[128] = "";
+    static char c_cereg[256] = "", c_cpin[64] = "", c_qnwinfo[256] = "";
+
+    time_t now_tools = time(NULL);
+    if (now_tools - last_tools_cache >= 30) {
+      send_at_command("AT+COPS?", c_cops, sizeof(c_cops));
+      send_at_command("AT+CREG?", c_creg, sizeof(c_creg));
+      send_at_command("AT+CSQ", c_csq, sizeof(c_csq));
+      send_at_command("AT+CGSN", c_cgsn, sizeof(c_cgsn));
+      send_at_command("AT+CIMI", c_cimi, sizeof(c_cimi));
+      send_at_command("AT+CEREG?", c_cereg, sizeof(c_cereg));
+      send_at_command("AT+CPIN?", c_cpin, sizeof(c_cpin));
+      send_at_command("AT+QNWINFO", c_qnwinfo, sizeof(c_qnwinfo));
+      last_tools_cache = now_tools;
+    }
     char cops_raw[256], creg_raw[256], csq_raw[128], cgsn_raw[128],
         cimi_raw[128];
     char cereg_raw[256], cpin_raw[64], qnwinfo_raw[256];
-
-    send_at_command("AT+COPS?", cops_raw, sizeof(cops_raw));
-    send_at_command("AT+CREG?", creg_raw, sizeof(creg_raw));
-    send_at_command("AT+CSQ", csq_raw, sizeof(csq_raw));
-    send_at_command("AT+CGSN", cgsn_raw, sizeof(cgsn_raw));
-    send_at_command("AT+CIMI", cimi_raw, sizeof(cimi_raw));
-    send_at_command("AT+CEREG?", cereg_raw, sizeof(cereg_raw));
-    send_at_command("AT+CPIN?", cpin_raw, sizeof(cpin_raw));
-    send_at_command("AT+QNWINFO", qnwinfo_raw, sizeof(qnwinfo_raw));
+    strncpy(cops_raw, c_cops, sizeof(cops_raw));
+    strncpy(creg_raw, c_creg, sizeof(creg_raw));
+    strncpy(csq_raw, c_csq, sizeof(csq_raw));
+    strncpy(cgsn_raw, c_cgsn, sizeof(cgsn_raw));
+    strncpy(cimi_raw, c_cimi, sizeof(cimi_raw));
+    strncpy(cereg_raw, c_cereg, sizeof(cereg_raw));
+    strncpy(cpin_raw, c_cpin, sizeof(cpin_raw));
+    strncpy(qnwinfo_raw, c_qnwinfo, sizeof(qnwinfo_raw));
 
     // Parse operator name from COPS
     char operator_name[64] = "Unknown";
@@ -1541,7 +1568,8 @@ void handle_client(br_sslio_context *ioc) {
         "  fetch('/?cmd=bt_json').then(r=>r.json()).then(function(d){"
         "    var txt='';"
         "    d.forEach(function(dev){"
-        "      txt+=dev.mac+' | '+dev.name+' | '+(dev.manufacturer||'Unknown')+' | '+dev.rssi+'dBm\\n';"
+        "      txt+=dev.mac+' | '+dev.name+' | "
+        "'+(dev.manufacturer||'Unknown')+' | '+dev.rssi+'dBm\\n';"
         "    });"
         "    document.getElementById('bt-devices').textContent=txt;"
         "    document.getElementById('bt-count').textContent=d.length;"
@@ -2521,13 +2549,17 @@ void handle_client(br_sslio_context *ioc) {
   }
 
   strcat(body, "</body></html>");
+  int body_len = strlen(body);
   char resp[16384]; // Header buffer
-  // Send header first
-  sprintf(resp, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: "
-                "close\r\n\r\n");
+  // Send header first (with Content-Length for faster browser rendering)
+  sprintf(resp,
+          "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: "
+          "%d\r\nConnection: "
+          "close\r\n\r\n",
+          body_len);
   br_sslio_write_all(ioc, resp, strlen(resp));
   // Send body
-  br_sslio_write_all(ioc, body, strlen(body));
+  br_sslio_write_all(ioc, body, body_len);
   br_sslio_flush(ioc);
 
   free(body);
@@ -2571,7 +2603,7 @@ int main(int argc, char *argv[]) {
   address.sin_addr.s_addr = INADDR_ANY;
   address.sin_port = htons(PORT);
   bind(server_fd, (struct sockaddr *)&address, sizeof(address));
-  listen(server_fd, 3);
+  listen(server_fd, 10);
 
   while (1) {
     // Update GPS (handles cell tower lookup every 30 seconds)
@@ -2581,7 +2613,7 @@ int main(int argc, char *argv[]) {
              accept(server_fd, (struct sockaddr *)&address, &addrlen)) >= 0) {
       // Set socket timeout to prevent blocking on incompatible TLS clients
       struct timeval tv;
-      tv.tv_sec = 10;
+      tv.tv_sec = 3;
       tv.tv_usec = 0;
       setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
       setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -2602,8 +2634,10 @@ int main(int argc, char *argv[]) {
                                (sizeof suites) / (sizeof suites[0]));
 
       // DEBUG: Check versions after
-      fprintf(stderr, "BearSSL config: Versions %04x-%04x, Suites Re-applied\n",
-              sc.eng.version_min, sc.eng.version_max);
+      // Debug removed for performance
+      // fprintf(stderr, "BearSSL config: Versions %04x-%04x, Suites
+      // Re-applied\n",
+      //         sc.eng.version_min, sc.eng.version_max);
 
       // Set up BearSSL I/O wrapper
       br_sslio_context ioc;
