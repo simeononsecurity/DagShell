@@ -72,8 +72,10 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 
 # 7. Start DagShell
+# NOTE: </dev/null keeps fd 0 open. Without it, socket() can return fd 0,
+# which triggers the server_fd==0 exit check bug in the binary.
 sleep 5
-/data/orbic_app &
+/data/orbic_app </dev/null &
 echo "" >> $BOOTLOG
 echo "[OK] orbic_app started PID=$!" >> $BOOTLOG
 echo "=== BOOT COMPLETE ===" >> $BOOTLOG
