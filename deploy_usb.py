@@ -41,12 +41,24 @@ import time
 from pathlib import Path
 
 # Optional pyusb for USB mode switching and AT+SYSCMD
+# We also probe for a working libusb backend at import time so that a
+# missing native library (e.g. libusb not installed via brew/apt) degrades
+# gracefully to the ADB-only path instead of crashing at runtime.
 try:
     import usb.core
     import usb.util
+    # Probe for a working backend — raises NoBackendError if libusb is absent
+    usb.core.find()
     HAS_PYUSB = True
 except ImportError:
     HAS_PYUSB = False
+except usb.core.NoBackendError:
+    HAS_PYUSB = False
+    print("  [!] pyusb is installed but no libusb backend was found.")
+    print("      Install libusb to enable USB mode switching and AT+SYSCMD:")
+    print("        macOS:  brew install libusb")
+    print("        Linux:  sudo apt install libusb-1.0-0")
+    print("      Falling back to ADB-only mode.\n")
 
 
 # =============================================================================
