@@ -76,6 +76,19 @@ SERIAL_INTERFACE   = 1
 SERIAL_OUT_EP      = 0x02
 SERIAL_IN_EP       = 0x82
 
+# Settle time (seconds) to let the device fully re-enumerate and bring up
+# atfwd_daemon after a USB mode switch / reboot before we hammer it with
+# AT+SYSCMD commands. Skipping this is what caused "Operation timed out" /
+# "No such device" failures on the first post-switch run.
+USB_STABILIZE_SEC  = 8
+
+
+class ATDeviceLost(Exception):
+    """Raised when the USB device disappears mid-AT-command (errno 19 / no
+    such device). Signals the caller to stop retrying and fall back to ADB."""
+    pass
+
+
 
 # =============================================================================
 # File paths
@@ -380,20 +393,57 @@ def at_syscmd_raw(dev, command: str, timeout_ms: int = 3000) -> bool:
             return True
 
     except usb.core.USBError as exc:
+        # errno 19 ("No such device") means the device handle is stale — the
+        # device re-enumerated or dropped off the bus. Retrying is pointless;
+        # signal the caller to fall back to the ADB shell path.
+        err_lower = str(exc).lower()
+        if getattr(exc, "errno", None) == 19 or "no such device" in err_lower:
+            raise ATDeviceLost(str(exc))
         print(f"  [!] USB error in AT+SYSCMD ({command[:40]}…): {exc}")
         return False
 
 
 def at_cmd(dev, command: str, retries: int = 3) -> bool:
-    """Print and execute a single AT+SYSCMD command with automatic retry."""
+    """Print and execute a single AT+SYSCMD command with automatic retry.
+
+    Propagates ATDeviceLost (does not swallow it) so the caller can abort the
+    AT path immediately instead of retrying every command against a dead handle.
+    """
     print(f"  AT+SYSCMD: {command}")
     for attempt in range(retries):
-        if at_syscmd_raw(dev, command):
+        if at_syscmd_raw(dev, command):   # may raise ATDeviceLost
             return True
         if attempt < retries - 1:
             time.sleep(1)
     print(f"  [!] Command may have failed after {retries} attempts: {command}")
     return False
+
+
+def at_health_check(dev, attempts: int = 6, delay: float = 2.0) -> bool:
+    """
+    Confirm the AT+SYSCMD interface is actually responsive before running the
+    bulk of privileged commands.
+
+    Right after a USB mode switch / reboot the device may accept the interface
+    claim but still be settling — commands then time out or the handle goes
+    stale ("No such device"). We send a cheap no-op (`true`) and wait for the
+    atfwd_daemon to answer, retrying with pauses. Returns False if the device
+    never responds or drops off the bus.
+    """
+    print(f"  Health check: probing AT interface ({attempts} attempts)…")
+    for i in range(1, attempts + 1):
+        try:
+            if at_syscmd_raw(dev, "true", timeout_ms=2000):
+                print(f"  [✓] AT interface responsive (attempt {i}).")
+                return True
+        except ATDeviceLost:
+            print("  [!] AT interface dropped off the bus during health check.")
+            return False
+        print(f"  [.] AT interface not ready yet (attempt {i}/{attempts}) — waiting {delay:.0f}s…")
+        time.sleep(delay)
+    print("  [!] AT interface never became responsive.")
+    return False
+
 
 
 def release_at_interface(dev) -> None:
@@ -588,10 +638,193 @@ def verify_deployment() -> bool:
 
 
 # =============================================================================
+# Install paths (AT+SYSCMD primary, ADB shell fallback)
+# =============================================================================
+
+def install_via_adb_shell(has_ssl: bool, ssl_root: Path) -> None:
+    """
+    Install DagShell using the root ADB shell (fallback when the AT serial
+    interface is unavailable or drops out). Stock Orbic RCL400 ADB shells run
+    as root, so /data/ writes and iptables succeed here.
+    """
+    # The AT path may have killed the ADB server — make sure it's back.
+    print("  Waiting for ADB to be ready…")
+    if not wait_for_adb(timeout_sec=30):
+        print("  [✗] ADB did not reconnect. Run:  adb start-server  and retry.")
+        sys.exit(1)
+
+    # Health check: confirm the ADB shell actually answers before we rely on it.
+    probe = adb_shell("echo dagshell_ready", check=False).strip()
+    if "dagshell_ready" not in probe:
+        print(f"  [!] ADB shell health check inconclusive (got: {probe[:60]!r}) — continuing anyway.")
+    else:
+        print("  [✓] ADB shell responsive.")
+
+    # Check whether the ADB shell is root — determines if /data/ is writable.
+    uid_line = adb_shell("id", check=False).split("\n")[0].strip()
+    is_root = "uid=0" in uid_line
+    print(f"  ADB shell identity: {uid_line or '(unknown)'}")
+    if is_root:
+        print("  [✓] ADB shell has root — proceeding with adb shell install.")
+    else:
+        print("  [!] ADB shell is NOT root. Operations on /data/ may fail silently.")
+        print("      If files don't copy, retry with:  sudo python3 deploy_usb.py")
+
+    print()
+    print("  Moving files to /data/ via adb shell…")
+    for src, dst in [
+        (REMOTE_TMP_APP,  REMOTE_FILE),
+        (REMOTE_TMP_BOOT, REMOTE_BOOT),
+    ]:
+        print(f"  mv {src} → {dst}")
+        adb_shell(f"mv {src} {dst}", check=False)
+
+    print("  Setting permissions…")
+    adb_shell(f"chmod +x {REMOTE_FILE}",  check=False)
+    adb_shell(f"chmod +x {REMOTE_BOOT}",  check=False)
+
+    if has_ssl:
+        print("  Installing SSL certificates…")
+        adb_shell("mv /tmp/server.der     /data/server.der",     check=False)
+        adb_shell("mv /tmp/server.key.der /data/server.key.der", check=False)
+        adb_shell("chmod 600 /data/server.key.der",              check=False)
+        if ssl_root.exists():
+            adb_shell("mv /tmp/root.der /data/root.der", check=False)
+
+    # Verify the firmware actually landed
+    check_out = adb_shell(f"ls -la {REMOTE_FILE} 2>&1", check=False)
+    if "No such file" in check_out or not check_out.strip():
+        print(f"  [✗] {REMOTE_FILE} not found after copy — ADB shell likely lacks root.")
+        print("      Retry with:  sudo python3 deploy_usb.py")
+        sys.exit(1)
+    print(f"  [✓] Verified: {check_out.strip()}")
+
+    # ── Configure network (ADB shell has root, so iptables works) ────────
+    if is_root:
+        print()
+        print("  Configuring network (iptables / NAT)…")
+        adb_shell("iptables -I INPUT -p tcp --dport 8443 -j ACCEPT",             check=False)
+        adb_shell("iptables -I INPUT -p tcp --dport 8080 -j ACCEPT",             check=False)
+        adb_shell("iptables -t nat -F PREROUTING",                               check=False)
+        adb_shell("echo 1 > /proc/sys/net/ipv4/ip_forward",                     check=False)
+        adb_shell("iptables -t nat -A POSTROUTING -o rmnet_data0 -j MASQUERADE", check=False)
+        adb_shell("iptables -A FORWARD -i bridge0 -o rmnet_data0 -j ACCEPT",     check=False)
+        adb_shell("iptables -A FORWARD -i rmnet_data0 -o bridge0 -m state --state RELATED,ESTABLISHED -j ACCEPT", check=False)
+
+    # ── Boot persistence via adb shell (works because ADB is root) ───────
+    if is_root:
+        print()
+        print("  Setting up boot persistence (USB composition hook)…")
+        adb_shell(f"sed -i '/dagshell_boot.sh/d' /data/dnsmasq.conf",          check=False)
+        adb_shell(f"rm -f {USB_WRAPPER_PATH}",                                  check=False)
+        adb_shell(f"echo '#!/bin/sh' > {USB_WRAPPER_PATH}",                    check=False)
+        adb_shell(f"echo '# DagShell USB boot wrapper' >> {USB_WRAPPER_PATH}", check=False)
+        adb_shell(f"echo 'sh {REMOTE_BOOT} &' >> {USB_WRAPPER_PATH}",          check=False)
+        adb_shell(f"echo '{USB_ORIGINAL} \"$@\"' >> {USB_WRAPPER_PATH}",       check=False)
+        adb_shell(f"chmod +x {USB_WRAPPER_PATH}",                              check=False)
+        print("  Boot hook installed.")
+
+    # ── Start the app — survive ADB session disconnect ─────────────────
+    #
+    # Android cgroups kill the entire ADB shell process group when the
+    # connection drops — setsid/nohup alone are not enough.
+    #
+    # Strategy:
+    #  1. Run dagshell_boot.sh via setsid to set up iptables/NAT and start
+    #     the netcat shell listener on port 24 (those may survive briefly).
+    #  2. Forward port 24 locally and send the orbic_app start command
+    #     through that shell, which lives in init's cgroup rather than the
+    #     ADB cgroup → survives after our ADB session ends.
+    #  3. Fall back to a direct setsid launch if nc isn't up yet.
+    print()
+    print("  Running dagshell_boot.sh (sets up iptables / NAT / nc listener)…")
+    adb_shell(f"setsid sh {REMOTE_BOOT} </dev/null >/dev/null 2>&1 &", check=False)
+    # Give the boot script time to start the nc listener (it has sleep 5
+    # before launching orbic_app, but nc starts earlier).
+    time.sleep(8)
+
+    # Try to launch orbic_app through the nc shell on port 24.
+    launched_via_nc = False
+    try:
+        print("  Forwarding port 24 (nc shell) to launch orbic_app from init context…")
+        subprocess.run(
+            ["adb", "forward", "tcp:12024", "tcp:24"],
+            capture_output=True, timeout=10,
+        )
+        time.sleep(1)
+        import socket
+        with socket.create_connection(("127.0.0.1", 12024), timeout=5) as s:
+            cmd = (
+                f"pkill -f orbic_app 2>/dev/null; sleep 1; "
+                f"{REMOTE_FILE} >/data/orbic_app.log 2>&1 &\n"
+            )
+            s.sendall(cmd.encode())
+            time.sleep(3)
+        launched_via_nc = True
+        print("  orbic_app start command sent via init-context nc shell.")
+    except Exception as exc:
+        print(f"  [!] nc shell launch failed ({exc}) — falling back to setsid direct launch…")
+        adb_shell(
+            f"pkill -f orbic_app 2>/dev/null; sleep 1; "
+            f"setsid {REMOTE_FILE} </dev/null >/data/orbic_app.log 2>&1 &",
+            check=False,
+        )
+        time.sleep(3)
+
+    # Verify the process is alive
+    ps_out = adb_shell("pgrep -f orbic_app 2>/dev/null", check=False).strip()
+    if ps_out:
+        print(f"  [✓] orbic_app running (PID {ps_out})")
+    else:
+        print("  [!] orbic_app did not start — check /data/boot_diag.log or /data/orbic_app.log")
+
+
+def install_via_at(at_dev, has_ssl: bool, ssl_root: Path) -> None:
+    """
+    Install DagShell via AT+SYSCMD over the USB serial interface (root via
+    atfwd_daemon). May raise ATDeviceLost if the device drops mid-install, in
+    which case the caller should fall back to install_via_adb_shell().
+    """
+    print("  [✓] AT interface open — running privileged commands via AT+SYSCMD")
+    print()
+    print("  Moving files to /data/ …")
+    at_cmd(at_dev, f"mv {REMOTE_TMP_APP}  {REMOTE_FILE}")
+    at_cmd(at_dev, f"mv {REMOTE_TMP_BOOT} {REMOTE_BOOT}")
+    at_cmd(at_dev, f"chmod +x {REMOTE_FILE}")
+    at_cmd(at_dev, f"chmod +x {REMOTE_BOOT}")
+
+    if has_ssl:
+        print("  Installing SSL certificates…")
+        at_cmd(at_dev, "mv /tmp/server.der     /data/server.der")
+        at_cmd(at_dev, "mv /tmp/server.key.der /data/server.key.der")
+        at_cmd(at_dev, "chmod 600 /data/server.key.der")
+        if ssl_root.exists():
+            at_cmd(at_dev, "mv /tmp/root.der /data/root.der")
+
+    print()
+    print("  Configuring network…")
+    at_cmd(at_dev, "iptables -I INPUT -p tcp --dport 8443 -j ACCEPT")
+    at_cmd(at_dev, "iptables -I INPUT -p tcp --dport 8080 -j ACCEPT")
+    at_cmd(at_dev, "iptables -t nat -F PREROUTING")
+    at_cmd(at_dev, "echo 1 > /proc/sys/net/ipv4/ip_forward")
+    at_cmd(at_dev, "iptables -t nat -A POSTROUTING -o rmnet_data0 -j MASQUERADE")
+    at_cmd(at_dev, "iptables -A FORWARD -i bridge0 -o rmnet_data0 -j ACCEPT")
+    at_cmd(at_dev, "iptables -A FORWARD -i rmnet_data0 -o bridge0 -m state --state RELATED,ESTABLISHED -j ACCEPT")
+
+    print()
+    setup_autostart(at_dev)
+
+    print()
+    print("  Starting orbic_app…")
+    at_cmd(at_dev, f"{REMOTE_FILE} &")
+
+
+# =============================================================================
 # Main deployment flow
 # =============================================================================
 
 def deploy() -> None:
+
     banner = "=" * 58
     print(banner)
     print("  DagShell USB Deployer")
@@ -718,172 +951,44 @@ def deploy() -> None:
     print("  Opening USB AT command interface (interface 1)…")
     at_dev = open_at_interface()
 
+    # After a USB mode switch + reboot the device often needs extra time before
+    # atfwd_daemon will answer. Pause, then health-check the AT interface so we
+    # don't fire a wall of commands at a half-booted device (which produced the
+    # "Operation timed out" / "No such device" failures previously).
+    if at_dev is not None:
+        if need_reboot:
+            print(f"  Letting device settle for {USB_STABILIZE_SEC}s after reboot…")
+            time.sleep(USB_STABILIZE_SEC)
+        if not at_health_check(at_dev):
+            print("  [!] AT interface not responsive — switching to ADB shell fallback.")
+            release_at_interface(at_dev)
+            try:
+                subprocess.run(["adb", "start-server"], capture_output=True, timeout=10)
+            except Exception:
+                pass
+            at_dev = None
+
     if at_dev is None:
-        # ─── Fallback: adb shell ──────────────────────────────────────────────
-        # open_at_interface() killed the ADB server — wait for it to reconnect.
-        print("  [!] Could not open AT serial interface.")
-        print("  Waiting for ADB to reconnect after server restart…")
-        if not wait_for_adb(timeout_sec=30):
-            print("  [✗] ADB did not reconnect. Run:  adb start-server  and retry.")
-            sys.exit(1)
-
-        # Check whether the ADB shell is root — determines if /data/ is writable.
-        uid_line = adb_shell("id", check=False).split("\n")[0].strip()
-        is_root = "uid=0" in uid_line
-        print(f"  ADB shell identity: {uid_line or '(unknown)'}")
-        if is_root:
-            print("  [✓] ADB shell has root — proceeding with adb shell install.")
-        else:
-            print("  [!] ADB shell is NOT root. Operations on /data/ may fail silently.")
-            print("      If files don't copy, retry with:  sudo python3 deploy_usb.py")
-
-        print()
-        print("  Moving files to /data/ via adb shell…")
-        for src, dst in [
-            (REMOTE_TMP_APP,  REMOTE_FILE),
-            (REMOTE_TMP_BOOT, REMOTE_BOOT),
-        ]:
-            print(f"  mv {src} → {dst}")
-            adb_shell(f"mv {src} {dst}", check=False)
-
-        print("  Setting permissions…")
-        adb_shell(f"chmod +x {REMOTE_FILE}",  check=False)
-        adb_shell(f"chmod +x {REMOTE_BOOT}",  check=False)
-
-        if has_ssl:
-            print("  Installing SSL certificates…")
-            adb_shell("mv /tmp/server.der     /data/server.der",     check=False)
-            adb_shell("mv /tmp/server.key.der /data/server.key.der", check=False)
-            adb_shell("chmod 600 /data/server.key.der",              check=False)
-            if ssl_root.exists():
-                adb_shell("mv /tmp/root.der /data/root.der", check=False)
-
-        # Verify the firmware actually landed
-        check_out = adb_shell(f"ls -la {REMOTE_FILE} 2>&1", check=False)
-        if "No such file" in check_out or not check_out.strip():
-            print(f"  [✗] {REMOTE_FILE} not found after copy — ADB shell likely lacks root.")
-            print("      Retry with:  sudo python3 deploy_usb.py")
-            sys.exit(1)
-        print(f"  [✓] Verified: {check_out.strip()}")
-
-        # ── Configure network (ADB shell has root, so iptables works) ────────
-        if is_root:
-            print()
-            print("  Configuring network (iptables / NAT)…")
-            adb_shell("iptables -I INPUT -p tcp --dport 8443 -j ACCEPT",             check=False)
-            adb_shell("iptables -I INPUT -p tcp --dport 8080 -j ACCEPT",             check=False)
-            adb_shell("iptables -t nat -F PREROUTING",                               check=False)
-            adb_shell("echo 1 > /proc/sys/net/ipv4/ip_forward",                     check=False)
-            adb_shell("iptables -t nat -A POSTROUTING -o rmnet_data0 -j MASQUERADE", check=False)
-            adb_shell("iptables -A FORWARD -i bridge0 -o rmnet_data0 -j ACCEPT",     check=False)
-            adb_shell("iptables -A FORWARD -i rmnet_data0 -o bridge0 -m state --state RELATED,ESTABLISHED -j ACCEPT", check=False)
-
-        # ── Boot persistence via adb shell (works because ADB is root) ───────
-        if is_root:
-            print()
-            print("  Setting up boot persistence (USB composition hook)…")
-            adb_shell(f"sed -i '/dagshell_boot.sh/d' /data/dnsmasq.conf",          check=False)
-            adb_shell(f"rm -f {USB_WRAPPER_PATH}",                                  check=False)
-            adb_shell(f"echo '#!/bin/sh' > {USB_WRAPPER_PATH}",                    check=False)
-            adb_shell(f"echo '# DagShell USB boot wrapper' >> {USB_WRAPPER_PATH}", check=False)
-            adb_shell(f"echo 'sh {REMOTE_BOOT} &' >> {USB_WRAPPER_PATH}",          check=False)
-            adb_shell(f"echo '{USB_ORIGINAL} \"$@\"' >> {USB_WRAPPER_PATH}",       check=False)
-            adb_shell(f"chmod +x {USB_WRAPPER_PATH}",                              check=False)
-            print("  Boot hook installed.")
-
-        # ── Start the app — survive ADB session disconnect ─────────────────
-        #
-        # Android cgroups kill the entire ADB shell process group when the
-        # connection drops — setsid/nohup alone are not enough.
-        #
-        # Strategy:
-        #  1. Run dagshell_boot.sh via setsid to set up iptables/NAT and start
-        #     the netcat shell listener on port 24 (those may survive briefly).
-        #  2. Forward port 24 locally and send the orbic_app start command
-        #     through that shell, which lives in init's cgroup rather than the
-        #     ADB cgroup → survives after our ADB session ends.
-        #  3. Fall back to a direct setsid launch if nc isn't up yet.
-        print()
-        print("  Running dagshell_boot.sh (sets up iptables / NAT / nc listener)…")
-        adb_shell(f"setsid sh {REMOTE_BOOT} </dev/null >/dev/null 2>&1 &", check=False)
-        # Give the boot script time to start the nc listener (it has sleep 5
-        # before launching orbic_app, but nc starts earlier).
-        time.sleep(8)
-
-        # Try to launch orbic_app through the nc shell on port 24.
-        # The nc listener (`busybox nc -ll -p 24 -e /bin/sh`) is started near
-        # the top of dagshell_boot.sh in init context — its children inherit
-        # that context and survive ADB disconnects.
-        launched_via_nc = False
-        try:
-            print("  Forwarding port 24 (nc shell) to launch orbic_app from init context…")
-            subprocess.run(
-                ["adb", "forward", "tcp:12024", "tcp:24"],
-                capture_output=True, timeout=10,
-            )
-            time.sleep(1)
-            import socket
-            with socket.create_connection(("127.0.0.1", 12024), timeout=5) as s:
-                cmd = (
-                    f"pkill -f orbic_app 2>/dev/null; sleep 1; "
-                    f"{REMOTE_FILE} >/data/orbic_app.log 2>&1 &\n"
-                )
-                s.sendall(cmd.encode())
-                time.sleep(3)
-            launched_via_nc = True
-            print("  orbic_app start command sent via init-context nc shell.")
-        except Exception as exc:
-            print(f"  [!] nc shell launch failed ({exc}) — falling back to setsid direct launch…")
-            adb_shell(
-                f"pkill -f orbic_app 2>/dev/null; sleep 1; "
-                f"setsid {REMOTE_FILE} </dev/null >/data/orbic_app.log 2>&1 &",
-                check=False,
-            )
-            time.sleep(3)
-
-        # Verify the process is alive
-        ps_out = adb_shell("pgrep -f orbic_app 2>/dev/null", check=False).strip()
-        if ps_out:
-            print(f"  [✓] orbic_app running (PID {ps_out})")
-        else:
-            print("  [!] orbic_app did not start — check /data/boot_diag.log or /data/orbic_app.log")
-
+        # ─── Fallback: ADB shell (no usable AT interface) ─────────────────────
+        print("  [!] Using ADB shell install path.")
+        install_via_adb_shell(has_ssl, ssl_root)
     else:
-        # ─── Full install via AT+SYSCMD ───────────────────────────────────────
-        print("  [✓] AT interface open — running privileged commands via AT+SYSCMD")
-        print()
-        print("  Moving files to /data/ …")
-        at_cmd(at_dev, f"mv {REMOTE_TMP_APP}  {REMOTE_FILE}")
-        at_cmd(at_dev, f"mv {REMOTE_TMP_BOOT} {REMOTE_BOOT}")
-        at_cmd(at_dev, f"chmod +x {REMOTE_FILE}")
-        at_cmd(at_dev, f"chmod +x {REMOTE_BOOT}")
-
-        if has_ssl:
-            print("  Installing SSL certificates…")
-            at_cmd(at_dev, "mv /tmp/server.der     /data/server.der")
-            at_cmd(at_dev, "mv /tmp/server.key.der /data/server.key.der")
-            at_cmd(at_dev, "chmod 600 /data/server.key.der")
-            if ssl_root.exists():
-                at_cmd(at_dev, "mv /tmp/root.der /data/root.der")
-
-        print()
-        print("  Configuring network…")
-        at_cmd(at_dev, "iptables -I INPUT -p tcp --dport 8443 -j ACCEPT")
-        at_cmd(at_dev, "iptables -I INPUT -p tcp --dport 8080 -j ACCEPT")
-        at_cmd(at_dev, "iptables -t nat -F PREROUTING")
-        at_cmd(at_dev, "echo 1 > /proc/sys/net/ipv4/ip_forward")
-        at_cmd(at_dev, "iptables -t nat -A POSTROUTING -o rmnet_data0 -j MASQUERADE")
-        at_cmd(at_dev, "iptables -A FORWARD -i bridge0 -o rmnet_data0 -j ACCEPT")
-        at_cmd(at_dev, "iptables -A FORWARD -i rmnet_data0 -o bridge0 -m state --state RELATED,ESTABLISHED -j ACCEPT")
-
-        print()
-        setup_autostart(at_dev)
-
-        print()
-        print("  Starting orbic_app…")
-        at_cmd(at_dev, f"{REMOTE_FILE} &")
-
-        release_at_interface(at_dev)
+        # ─── Primary: AT+SYSCMD, with automatic ADB fallback on mid-run drop ──
+        try:
+            install_via_at(at_dev, has_ssl, ssl_root)
+        except ATDeviceLost as exc:
+            print(f"  [!] AT interface dropped mid-install ({exc}).")
+            print("  Restarting ADB and finishing via ADB shell fallback…")
+            release_at_interface(at_dev)
+            at_dev = None
+            try:
+                subprocess.run(["adb", "start-server"], capture_output=True, timeout=10)
+            except Exception:
+                pass
+            install_via_adb_shell(has_ssl, ssl_root)
+        finally:
+            if at_dev is not None:
+                release_at_interface(at_dev)
 
     # ── Done ──────────────────────────────────────────────────────────────────
     print()
