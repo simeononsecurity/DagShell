@@ -10,9 +10,23 @@ How it works (matching Rayhunter installer/src/orbic.rs):
   2. Sends a USB vendor control request to switch it into ADB/debug mode (PID 0xf601)
   3. Device reboots and re-enumerates with ADB interface exposed
   4. Pushes firmware files to /tmp/ via 'adb push' (ADB user can write /tmp)
-  5. Uses AT+SYSCMD via USB serial (interface 1) to move files to /data/ and chmod as root
-  6. Sets up boot persistence via USB composition hook (same hook as deploy_base64.py)
-  7. Opens firewall and starts orbic_app
+  5. Installs a SUID rootshell binary via AT+SYSCMD (3 commands: cp, chown, chmod)
+  6. Uses 'adb shell /bin/rootshell -c "cmd"' for all remaining privileged ops
+  7. Sets up boot persistence via USB composition hook
+  8. Reboots device — boot script applies iptables and starts orbic_app
+
+Root Gain Strategy (mirrors Rayhunter setup_rootshell()):
+  Fresh Orbic devices have ADB shell as uid=2000 (NOT root).
+  AT+SYSCMD runs via atfwd_daemon which IS root — used only for the 3-command
+  rootshell install (cp, chown root, chmod 4755). After that, all privileged
+  operations go through 'adb shell /bin/rootshell -c "command"'.
+
+  If Rayhunter was previously installed, /bin/rootshell already exists and the
+  AT+SYSCMD step is skipped entirely.
+
+  NOTE: iptables via rootshell FAILS (SUID doesn't grant CAP_NET_ADMIN).
+  Firewall rules are applied by dagshell_boot.sh which runs from init context
+  (has full capabilities) on every boot.
 
 USB IDs (from Rayhunter installer/src/orbic.rs):
   Vendor:  0x05c6  (Qualcomm)
@@ -78,8 +92,7 @@ SERIAL_IN_EP       = 0x82
 
 # Settle time (seconds) to let the device fully re-enumerate and bring up
 # atfwd_daemon after a USB mode switch / reboot before we hammer it with
-# AT+SYSCMD commands. Skipping this is what caused "Operation timed out" /
-# "No such device" failures on the first post-switch run.
+# AT+SYSCMD commands.
 USB_STABILIZE_SEC  = 8
 
 
@@ -87,7 +100,6 @@ class ATDeviceLost(Exception):
     """Raised when the USB device disappears mid-AT-command (errno 19 / no
     such device). Signals the caller to stop retrying and fall back to ADB."""
     pass
-
 
 
 # =============================================================================
@@ -98,19 +110,31 @@ SCRIPT_DIR       = Path(__file__).parent.absolute()
 FIRMWARE_DIR     = SCRIPT_DIR / "orbic_fw_c"
 FIRMWARE_FILE    = "orbic_app"
 BOOT_SCRIPT_FILE = "dagshell_boot.sh"
+ROOTSHELL_FILE   = "rootshell"
 
 FIRMWARE_PATH    = FIRMWARE_DIR / FIRMWARE_FILE
 BOOT_SCRIPT_PATH = SCRIPT_DIR / BOOT_SCRIPT_FILE
+ROOTSHELL_PATH   = FIRMWARE_DIR / ROOTSHELL_FILE
 
 # Remote locations on device
-REMOTE_TMP_APP   = "/tmp/orbic_app"
-REMOTE_FILE      = "/data/orbic_app"
-REMOTE_TMP_BOOT  = "/tmp/dagshell_boot.sh"
-REMOTE_BOOT      = "/data/dagshell_boot.sh"
+REMOTE_TMP_APP       = "/tmp/orbic_app"
+REMOTE_FILE          = "/data/orbic_app"
+REMOTE_TMP_BOOT      = "/tmp/dagshell_boot.sh"
+REMOTE_BOOT          = "/data/dagshell_boot.sh"
+REMOTE_TMP_ROOTSHELL = "/tmp/rootshell"
+REMOTE_ROOTSHELL     = "/bin/rootshell"
 
 # USB persistence hook (same method used by deploy_base64.py)
 USB_WRAPPER_PATH = "/data/usb/boot_hsusb_composition"
 USB_ORIGINAL     = "/sbin/usb/compositions/PRJ_SLT779_9025"
+
+# Boot hook wrapper content — written as a file push rather than echo chains
+# to avoid AT+SYSCMD quoting issues
+BOOT_HOOK_CONTENT = f"""#!/bin/sh
+# DagShell USB boot wrapper
+sh {REMOTE_BOOT} &
+{USB_ORIGINAL} "$@"
+"""
 
 
 # =============================================================================
@@ -187,6 +211,19 @@ def adb_shell(cmd: str, check: bool = True) -> str:
     return adb(["shell", cmd], check=check, timeout=30)
 
 
+def rootshell_cmd(command: str, check: bool = False) -> str:
+    """
+    Run a privileged command via /bin/rootshell -c on the device.
+    This is the primary way to execute root operations after rootshell is
+    installed — mirrors Rayhunter's AdbConnection which routes all commands
+    through rootshell.
+    """
+    # Shell-escape: wrap command in single quotes for rootshell -c,
+    # but the whole thing is passed through adb shell which also interprets.
+    # Safest: pass as a single argument to rootshell.
+    return adb_shell(f'/bin/rootshell -c "{command}"', check=check)
+
+
 # =============================================================================
 # USB mode switch (mirrors Rayhunter enable_command_mode())
 # =============================================================================
@@ -247,15 +284,13 @@ def switch_to_adb_mode() -> bool:
 
     print("  Sending mode-switch vendor control request…")
     try:
-        # Set configuration so we can issue control requests
         try:
             dev.set_configuration()
         except Exception:
             pass
 
-        # Send the vendor control request (same semantics as Rayhunter nusb call)
         dev.ctrl_transfer(
-            bmRequestType=0x40,  # Host→Device | Vendor | Device
+            bmRequestType=0x40,
             bRequest=0xa0,
             wValue=0,
             wIndex=0,
@@ -266,8 +301,6 @@ def switch_to_adb_mode() -> bool:
         return True
 
     except usb.core.USBError as exc:
-        # A pipe/stall/timeout error is expected: the device reboots during the
-        # transfer, which Rayhunter also silently ignores.
         err_lower = str(exc).lower()
         if any(kw in err_lower for kw in ("pipe", "stall", "timeout", "no data")):
             print("  Mode-switch sent (device is rebooting)…")
@@ -299,9 +332,6 @@ def open_at_interface():
     if not HAS_PYUSB:
         return None
 
-    # Kill the ADB daemon so it releases its hold on the USB device.
-    # This is necessary because adbd claims the ADB interface (0) and keeps
-    # the device open, preventing pyusb from claiming the serial interface (1).
     print("  Stopping ADB daemon to release USB device…")
     try:
         subprocess.run(["adb", "kill-server"], capture_output=True, timeout=8)
@@ -314,15 +344,11 @@ def open_at_interface():
         print("  [!] Orbic ADB device not found after killing adb server.")
         return None
 
-    # Set USB configuration (required before claiming interfaces)
     try:
         dev.set_configuration()
     except Exception:
         pass
 
-    # Detach the kernel CDC ACM / serial driver from interface 1.
-    # On Linux this usually works.  On macOS it requires root or an entitlement;
-    # if it fails the claim attempt below will surface a clearer error.
     try:
         if dev.is_kernel_driver_active(SERIAL_INTERFACE):
             dev.detach_kernel_driver(SERIAL_INTERFACE)
@@ -339,7 +365,6 @@ def open_at_interface():
             print("  On macOS/Linux try:  sudo python3 deploy_usb.py")
         elif "busy" in err or "resource" in err:
             print("  Serial interface is busy. Try unplugging and replugging the device.")
-        # Restart ADB so fallback can still use adb shell
         try:
             subprocess.run(["adb", "start-server"], capture_output=True, timeout=10)
         except Exception:
@@ -363,8 +388,6 @@ def at_syscmd_raw(dev, command: str, timeout_ms: int = 3000) -> bool:
     payload = f"\r\nAT+SYSCMD={command}\r\n".encode()
 
     try:
-        # Step 1 — enable serial port (SET_CONTROL_LINE_STATE, RTS+DTR = 3)
-        # bmRequestType = 0x21 = Host→Device | Class | Interface
         dev.ctrl_transfer(
             bmRequestType=0x21,
             bRequest=0x22,
@@ -374,28 +397,21 @@ def at_syscmd_raw(dev, command: str, timeout_ms: int = 3000) -> bool:
             timeout=timeout_ms,
         )
 
-        # Step 2 — send the AT command
         dev.write(SERIAL_OUT_EP, payload, timeout=timeout_ms)
 
-        # Step 3 — consume the echoed command
         try:
             dev.read(SERIAL_IN_EP, 256, timeout=timeout_ms)
         except usb.core.USBTimeoutError:
             pass
 
-        # Step 4 — read the actual response
         try:
             raw = bytes(dev.read(SERIAL_IN_EP, 256, timeout=timeout_ms))
             resp = raw.decode("utf-8", errors="replace")
             return "\r\nOK\r\n" in resp
         except usb.core.USBTimeoutError:
-            # Some commands (background processes) don't return before timeout — treat as OK
             return True
 
     except usb.core.USBError as exc:
-        # errno 19 ("No such device") means the device handle is stale — the
-        # device re-enumerated or dropped off the bus. Retrying is pointless;
-        # signal the caller to fall back to the ADB shell path.
         err_lower = str(exc).lower()
         if getattr(exc, "errno", None) == 19 or "no such device" in err_lower:
             raise ATDeviceLost(str(exc))
@@ -411,7 +427,7 @@ def at_cmd(dev, command: str, retries: int = 3) -> bool:
     """
     print(f"  AT+SYSCMD: {command}")
     for attempt in range(retries):
-        if at_syscmd_raw(dev, command):   # may raise ATDeviceLost
+        if at_syscmd_raw(dev, command):
             return True
         if attempt < retries - 1:
             time.sleep(1)
@@ -423,12 +439,6 @@ def at_health_check(dev, attempts: int = 6, delay: float = 2.0) -> bool:
     """
     Confirm the AT+SYSCMD interface is actually responsive before running the
     bulk of privileged commands.
-
-    Right after a USB mode switch / reboot the device may accept the interface
-    claim but still be settling — commands then time out or the handle goes
-    stale ("No such device"). We send a cheap no-op (`true`) and wait for the
-    atfwd_daemon to answer, retrying with pauses. Returns False if the device
-    never responds or drops off the bus.
     """
     print(f"  Health check: probing AT interface ({attempts} attempts)…")
     for i in range(1, attempts + 1):
@@ -445,42 +455,246 @@ def at_health_check(dev, attempts: int = 6, delay: float = 2.0) -> bool:
     return False
 
 
-
 def release_at_interface(dev) -> None:
-    """Release the claimed serial interface."""
+    """Release the claimed serial interface and restart ADB server."""
     if dev is None:
         return
     try:
         usb.util.release_interface(dev, SERIAL_INTERFACE)
     except Exception:
         pass
+    # Always restart ADB server after releasing the AT interface
+    try:
+        subprocess.run(["adb", "start-server"], capture_output=True, timeout=10)
+    except Exception:
+        pass
 
 
 # =============================================================================
-# Boot persistence (mirrors deploy_base64.py setup_autostart)
+# Rootshell install (mirrors Rayhunter setup_rootshell() in orbic.rs)
 # =============================================================================
 
-def setup_autostart(at_dev) -> None:
+def check_rootshell_exists() -> bool:
     """
-    Hook DagShell into the USB composition init script so it starts on every boot.
-    The script /data/usb/boot_hsusb_composition is executed by the USB init daemon
-    on MDM9207.  We replace it with a wrapper that runs dagshell_boot.sh first,
-    then chains to the original composition script.
+    Check if /bin/rootshell is already installed and functional on the device.
+    Returns True if rootshell exists and grants uid=0.
+
+    If Rayhunter was previously installed, rootshell will already be at
+    /bin/rootshell with correct SUID permissions — no reinstall needed.
     """
+    try:
+        out = adb_shell('/bin/rootshell -c "id"', check=False).strip()
+        if "uid=0" in out:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def install_rootshell_via_at(at_dev) -> bool:
+    """
+    Install the rootshell SUID binary using AT+SYSCMD (3 commands).
+
+    Mirrors Rayhunter setup_rootshell() (installer/src/orbic.rs):
+      1. Push rootshell to /tmp/rootshell via ADB
+      2. AT+SYSCMD: cp /tmp/rootshell /bin/rootshell
+      3. AT+SYSCMD: chown root:root /bin/rootshell
+      4. AT+SYSCMD: chmod 4755 /bin/rootshell
+      5. Verify: adb shell /bin/rootshell -c id → uid=0
+
+    AT+SYSCMD runs via atfwd_daemon (PID 1 child, uid=0) which has the
+    authority to chown/chmod files owned by any user.
+
+    Returns True if rootshell is installed and verified, False otherwise.
+    May raise ATDeviceLost if the device drops mid-install.
+    """
+    print("  Installing rootshell via AT+SYSCMD (3 commands)…")
+
+    # The rootshell binary was already pushed to /tmp/rootshell via ADB
+    # in the file push step. Now use AT+SYSCMD to install it with root perms.
+    if not at_cmd(at_dev, f"cp {REMOTE_TMP_ROOTSHELL} {REMOTE_ROOTSHELL}"):
+        print("  [!] Failed to copy rootshell to /bin/")
+        return False
+
+    if not at_cmd(at_dev, f"chown root:root {REMOTE_ROOTSHELL}"):
+        print("  [!] Failed to chown rootshell")
+        return False
+
+    if not at_cmd(at_dev, f"chmod 4755 {REMOTE_ROOTSHELL}"):
+        print("  [!] Failed to chmod rootshell")
+        return False
+
+    print("  rootshell installed. Releasing AT interface for verification…")
+
+    # Release AT interface and restart ADB to verify rootshell
+    release_at_interface(at_dev)
+    time.sleep(2)
+
+    if not wait_for_adb(timeout_sec=30):
+        print("  [!] ADB did not reconnect after rootshell install.")
+        return False
+
+    # Verify rootshell grants uid=0
+    out = adb_shell('/bin/rootshell -c "id"', check=False).strip()
+    if "uid=0" in out:
+        print(f"  [✓] rootshell verified: {out}")
+        return True
+    else:
+        print(f"  [✗] rootshell verification failed: {out}")
+        return False
+
+
+# =============================================================================
+# Install via rootshell (primary path for all privileged operations)
+# =============================================================================
+
+def install_via_rootshell(has_ssl: bool, ssl_root: Path) -> None:
+    """
+    Install DagShell using /bin/rootshell for all privileged operations.
+    This is the primary install path — works on both fresh devices (after
+    AT+SYSCMD rootshell install) and Rayhunter-first devices (rootshell
+    already exists).
+
+    Mirrors Rayhunter's setup_rayhunter() which routes all commands through
+    its AdbConnection (which uses rootshell -c internally).
+
+    NOTE: iptables via rootshell FAILS with "Permission denied, you must be
+    root" because SUID doesn't grant CAP_NET_ADMIN capability. Firewall rules
+    are applied by dagshell_boot.sh which runs from init context on boot.
+    """
+    print()
+    print("  Installing files via rootshell…")
+
+    # Move files from /tmp to /data
+    for src, dst, label in [
+        (REMOTE_TMP_APP,  REMOTE_FILE,  "firmware"),
+        (REMOTE_TMP_BOOT, REMOTE_BOOT,  "boot script"),
+    ]:
+        print(f"  rootshell: cp {src} → {dst}  ({label})")
+        rootshell_cmd(f"cp {src} {dst}")
+
+    # Set permissions
+    print("  rootshell: setting permissions…")
+    rootshell_cmd(f"chmod 755 {REMOTE_FILE}")
+    rootshell_cmd(f"chmod 755 {REMOTE_BOOT}")
+
+    # Install SSL certificates
+    if has_ssl:
+        print("  rootshell: installing SSL certificates…")
+        rootshell_cmd("cp /tmp/server.der /data/server.der")
+        rootshell_cmd("cp /tmp/server.key.der /data/server.key.der")
+        rootshell_cmd("chmod 600 /data/server.key.der")
+        if ssl_root.exists():
+            rootshell_cmd("cp /tmp/root.der /data/root.der")
+
+    # Verify firmware landed
+    check_out = rootshell_cmd(f"ls -la {REMOTE_FILE}", check=False)
+    if "No such file" in check_out or not check_out.strip():
+        print(f"  [✗] {REMOTE_FILE} not found after copy!")
+        sys.exit(1)
+    print(f"  [✓] Verified: {check_out.strip()}")
+
+    # Install boot hook — push wrapper script to /tmp, then rootshell cp
+    print()
     print("  Setting up boot persistence (USB composition hook)…")
 
-    # Remove any stale dnsmasq references
-    at_cmd(at_dev, "sed -i '/dagshell_boot.sh/d' /data/dnsmasq.conf")
+    # Write boot hook content to a temp file locally, push via ADB, then cp
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+        f.write(BOOT_HOOK_CONTENT)
+        tmp_hook = f.name
 
-    # Build the wrapper script in /data/usb/
-    at_cmd(at_dev, f"rm -f {USB_WRAPPER_PATH}")
-    at_cmd(at_dev, f"echo '#!/bin/sh' > {USB_WRAPPER_PATH}")
-    at_cmd(at_dev, f"echo '# DagShell USB boot wrapper' >> {USB_WRAPPER_PATH}")
-    at_cmd(at_dev, f"echo 'sh {REMOTE_BOOT} &' >> {USB_WRAPPER_PATH}")
-    at_cmd(at_dev, f"echo '{USB_ORIGINAL} \"$@\"' >> {USB_WRAPPER_PATH}")
-    at_cmd(at_dev, f"chmod +x {USB_WRAPPER_PATH}")
+    try:
+        adb_push(tmp_hook, "/tmp/boot_hook.sh")
+    finally:
+        Path(tmp_hook).unlink(missing_ok=True)
 
-    print("  Boot hook installed.")
+    # Clean stale dnsmasq references
+    rootshell_cmd("sed -i '/dagshell_boot.sh/d' /data/dnsmasq.conf")
+
+    # Install the hook
+    rootshell_cmd(f"mkdir -p /data/usb")
+    rootshell_cmd(f"cp /tmp/boot_hook.sh {USB_WRAPPER_PATH}")
+    rootshell_cmd(f"chmod 755 {USB_WRAPPER_PATH}")
+
+    # Verify hook
+    hook_check = rootshell_cmd(f"cat {USB_WRAPPER_PATH}", check=False)
+    if "dagshell_boot.sh" in hook_check:
+        print("  [✓] Boot hook installed and verified.")
+    else:
+        print("  [!] Boot hook may not have installed correctly.")
+        print(f"      Content: {hook_check[:200]}")
+
+    # NOTE: We do NOT apply iptables here — rootshell lacks CAP_NET_ADMIN.
+    # dagshell_boot.sh applies firewall rules from init context on boot.
+    print()
+    print("  [i] Firewall rules will be applied on next boot by dagshell_boot.sh")
+    print("      (rootshell lacks CAP_NET_ADMIN for iptables)")
+
+
+# =============================================================================
+# Fallback: install via root ADB shell (Rayhunter-first devices)
+# =============================================================================
+
+def install_via_adb_root(has_ssl: bool, ssl_root: Path) -> None:
+    """
+    Fallback install path when ADB shell is already root (uid=0).
+    This happens on Rayhunter-first devices or when the stock device
+    was already rooted. Uses direct adb shell commands.
+    """
+    print("  [✓] ADB shell has root — using direct adb shell install.")
+    print()
+    print("  Moving files to /data/ via adb shell…")
+    for src, dst in [
+        (REMOTE_TMP_APP,  REMOTE_FILE),
+        (REMOTE_TMP_BOOT, REMOTE_BOOT),
+    ]:
+        print(f"  cp {src} → {dst}")
+        adb_shell(f"cp {src} {dst}", check=False)
+
+    print("  Setting permissions…")
+    adb_shell(f"chmod 755 {REMOTE_FILE}",  check=False)
+    adb_shell(f"chmod 755 {REMOTE_BOOT}",  check=False)
+
+    if has_ssl:
+        print("  Installing SSL certificates…")
+        adb_shell("cp /tmp/server.der     /data/server.der",     check=False)
+        adb_shell("cp /tmp/server.key.der /data/server.key.der", check=False)
+        adb_shell("chmod 600 /data/server.key.der",              check=False)
+        if ssl_root.exists():
+            adb_shell("cp /tmp/root.der /data/root.der", check=False)
+
+    # Verify firmware landed
+    check_out = adb_shell(f"ls -la {REMOTE_FILE} 2>&1", check=False)
+    if "No such file" in check_out or not check_out.strip():
+        print(f"  [✗] {REMOTE_FILE} not found after copy!")
+        sys.exit(1)
+    print(f"  [✓] Verified: {check_out.strip()}")
+
+    # Configure network (ADB root shell has full capabilities)
+    print()
+    print("  Configuring network (iptables / NAT)…")
+    adb_shell("iptables -I INPUT -p tcp --dport 8443 -j ACCEPT",             check=False)
+    adb_shell("iptables -I INPUT -p tcp --dport 8080 -j ACCEPT",             check=False)
+    adb_shell("iptables -t nat -F PREROUTING",                               check=False)
+    adb_shell("echo 1 > /proc/sys/net/ipv4/ip_forward",                     check=False)
+    adb_shell("iptables -t nat -A POSTROUTING -o rmnet_data0 -j MASQUERADE", check=False)
+    adb_shell("iptables -A FORWARD -i bridge0 -o rmnet_data0 -j ACCEPT",     check=False)
+    adb_shell("iptables -A FORWARD -i rmnet_data0 -o bridge0 -m state "
+              "--state RELATED,ESTABLISHED -j ACCEPT",                        check=False)
+
+    # Boot persistence
+    print()
+    print("  Setting up boot persistence (USB composition hook)…")
+    adb_shell(f"sed -i '/dagshell_boot.sh/d' /data/dnsmasq.conf",          check=False)
+    adb_shell(f"mkdir -p /data/usb",                                         check=False)
+    adb_shell(f"rm -f {USB_WRAPPER_PATH}",                                  check=False)
+    adb_shell(f"echo '#!/bin/sh' > {USB_WRAPPER_PATH}",                    check=False)
+    adb_shell(f"echo '# DagShell USB boot wrapper' >> {USB_WRAPPER_PATH}", check=False)
+    adb_shell(f"echo 'sh {REMOTE_BOOT} &' >> {USB_WRAPPER_PATH}",          check=False)
+    adb_shell(f"echo '{USB_ORIGINAL} \"$@\"' >> {USB_WRAPPER_PATH}",       check=False)
+    adb_shell(f"chmod +x {USB_WRAPPER_PATH}",                              check=False)
+    print("  [✓] Boot hook installed.")
 
 
 # =============================================================================
@@ -495,7 +709,6 @@ def verify_deployment() -> bool:
       adb_command(device, &["wget", "-O", "-", "http://localhost:8080/index.html"])
 
     We do the same for DagShell on port 8443 (HTTPS) plus extra port / log checks.
-    All commands run on the device itself through the existing ADB session.
     """
     print("\n" + "=" * 58)
     print("  Verifying deployment (via ADB — no WiFi needed)")
@@ -513,13 +726,10 @@ def verify_deployment() -> bool:
         all_ok = False
 
     # ── Check 2: port 8443 listening ──────────────────────────────────────────
-    # dagshell_boot.sh has a `sleep 5` before launching orbic_app; give it time.
     print("  Waiting 10s for orbic_app to bind port 8443…", end="", flush=True)
     time.sleep(10)
     print(" done.")
 
-    # Try netstat first, then nc -z, then /proc/net/tcp{,6}
-    # 8443 decimal = 0x20FB hex
     port_open = False
 
     ns = adb_shell("netstat -tlnp 2>/dev/null | grep ':8443'", check=False).strip()
@@ -528,14 +738,12 @@ def verify_deployment() -> bool:
         port_open = True
 
     if not port_open:
-        # nc -z does a TCP connect-only probe (no TLS) — fastest/most reliable
         nc_out = adb_shell("nc -z 127.0.0.1 8443 2>&1; echo rc=$?", check=False).strip()
         if "rc=0" in nc_out:
             print("  [✓] Port 8443 : REACHABLE  (nc -z probe)")
             port_open = True
 
     if not port_open:
-        # /proc/net/tcp stores local ports in big-endian hex: 8443 = 20FB
         for tcp_file in ("/proc/net/tcp6", "/proc/net/tcp"):
             entry = adb_shell(
                 f"grep -i ' 20FB' {tcp_file} 2>/dev/null | head -1", check=False
@@ -546,24 +754,14 @@ def verify_deployment() -> bool:
                 break
 
     if not port_open:
-        print("  [!] Port 8443 : not yet visible via netstat/nc/proc — "
-              "will confirm via TLS probe below")
+        print("  [!] Port 8443 : not yet visible — will confirm via TLS probe below")
 
-    # ── Check 3: HTTP(S) response from localhost via adb shell ────────────────
-    # This is the key check: hit the server directly on the device through ADB,
-    # exactly like Rayhunter's wget-to-localhost test — no WiFi connection needed.
-    #
-    # "Connection reset by peer" from busybox wget = SUCCESS:
-    #   • The TCP connection WAS established (port is open)
-    #   • The TLS handshake started but busybox's SSL implementation is
-    #     incompatible with BearSSL cipher suites → reset after ClientHello
-    #   • This is DIFFERENT from "Connection refused" (server not running)
+    # ── Check 3: TLS probe ────────────────────────────────────────────────────
     MAX_ATTEMPTS = 5
     web_ok = False
     print(f"  Probing https://127.0.0.1:8443/ via adb shell ({MAX_ATTEMPTS} attempts)…")
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        # busybox wget: -q quiet, -O - stdout, --no-check-certificate skip TLS verify
         raw = adb_shell(
             "wget -q -O - --no-check-certificate https://127.0.0.1:8443/ 2>&1 | head -5",
             check=False,
@@ -576,12 +774,10 @@ def verify_deployment() -> bool:
             web_ok = True
             break
         elif raw and any(kw in raw_lower for kw in ("ssl", "tls", "handshake", "certificate")):
-            # TLS handshake visible → server IS up, wget just can't finish it
             print(f"  [✓] Web server: TLS handshake confirmed — server is up  (attempt {attempt})")
             web_ok = True
             break
         elif raw and any(kw in raw_lower for kw in ("connection reset", "reset by peer", "peer reset")):
-            # TCP connect succeeded; TLS reset = BearSSL rejected busybox cipher → server IS up
             print(f"  [✓] Web server: TCP+TLS confirmed (reset by peer = BearSSL active, "
                   f"attempt {attempt})")
             web_ok = True
@@ -590,20 +786,15 @@ def verify_deployment() -> bool:
             print(f"  [!] Attempt {attempt}/{MAX_ATTEMPTS}: connection refused — "
                   "server not listening yet")
         elif raw:
-            # Unknown output — log it but keep trying
             print(f"  [?] Attempt {attempt}/{MAX_ATTEMPTS}: {raw[:120]}")
 
         if attempt < MAX_ATTEMPTS:
             time.sleep(3)
 
-    # If wget failed every time but nc says port is open → treat as OK
-    # (wget may simply not support --no-check-certificate on this busybox build)
     if not web_ok and port_open:
-        print("  [✓] Web server: port 8443 is open — "
-              "wget probe inconclusive but server IS running")
+        print("  [✓] Web server: port 8443 is open — server IS running")
         web_ok = True
 
-    # TLS response confirms the port IS open even if netstat/nc/proc missed it
     if web_ok and not port_open:
         print("  [✓] Port 8443 : confirmed reachable (TLS response received)")
         port_open = True
@@ -615,7 +806,7 @@ def verify_deployment() -> bool:
     if not port_open:
         all_ok = False
 
-    # ── Check 4: show boot log ─────────────────────────────────────────────────
+    # ── Check 4: boot log ─────────────────────────────────────────────────────
     boot_log = adb_shell("tail -15 /data/boot_diag.log 2>/dev/null", check=False).strip()
     if boot_log:
         print()
@@ -638,188 +829,6 @@ def verify_deployment() -> bool:
 
 
 # =============================================================================
-# Install paths (AT+SYSCMD primary, ADB shell fallback)
-# =============================================================================
-
-def install_via_adb_shell(has_ssl: bool, ssl_root: Path) -> None:
-    """
-    Install DagShell using the root ADB shell (fallback when the AT serial
-    interface is unavailable or drops out). Stock Orbic RCL400 ADB shells run
-    as root, so /data/ writes and iptables succeed here.
-    """
-    # The AT path may have killed the ADB server — make sure it's back.
-    print("  Waiting for ADB to be ready…")
-    if not wait_for_adb(timeout_sec=30):
-        print("  [✗] ADB did not reconnect. Run:  adb start-server  and retry.")
-        sys.exit(1)
-
-    # Health check: confirm the ADB shell actually answers before we rely on it.
-    probe = adb_shell("echo dagshell_ready", check=False).strip()
-    if "dagshell_ready" not in probe:
-        print(f"  [!] ADB shell health check inconclusive (got: {probe[:60]!r}) — continuing anyway.")
-    else:
-        print("  [✓] ADB shell responsive.")
-
-    # Check whether the ADB shell is root — determines if /data/ is writable.
-    uid_line = adb_shell("id", check=False).split("\n")[0].strip()
-    is_root = "uid=0" in uid_line
-    print(f"  ADB shell identity: {uid_line or '(unknown)'}")
-    if is_root:
-        print("  [✓] ADB shell has root — proceeding with adb shell install.")
-    else:
-        print("  [!] ADB shell is NOT root. Operations on /data/ may fail silently.")
-        print("      If files don't copy, retry with:  sudo python3 deploy_usb.py")
-
-    print()
-    print("  Moving files to /data/ via adb shell…")
-    for src, dst in [
-        (REMOTE_TMP_APP,  REMOTE_FILE),
-        (REMOTE_TMP_BOOT, REMOTE_BOOT),
-    ]:
-        print(f"  mv {src} → {dst}")
-        adb_shell(f"mv {src} {dst}", check=False)
-
-    print("  Setting permissions…")
-    adb_shell(f"chmod +x {REMOTE_FILE}",  check=False)
-    adb_shell(f"chmod +x {REMOTE_BOOT}",  check=False)
-
-    if has_ssl:
-        print("  Installing SSL certificates…")
-        adb_shell("mv /tmp/server.der     /data/server.der",     check=False)
-        adb_shell("mv /tmp/server.key.der /data/server.key.der", check=False)
-        adb_shell("chmod 600 /data/server.key.der",              check=False)
-        if ssl_root.exists():
-            adb_shell("mv /tmp/root.der /data/root.der", check=False)
-
-    # Verify the firmware actually landed
-    check_out = adb_shell(f"ls -la {REMOTE_FILE} 2>&1", check=False)
-    if "No such file" in check_out or not check_out.strip():
-        print(f"  [✗] {REMOTE_FILE} not found after copy — ADB shell likely lacks root.")
-        print("      Retry with:  sudo python3 deploy_usb.py")
-        sys.exit(1)
-    print(f"  [✓] Verified: {check_out.strip()}")
-
-    # ── Configure network (ADB shell has root, so iptables works) ────────
-    if is_root:
-        print()
-        print("  Configuring network (iptables / NAT)…")
-        adb_shell("iptables -I INPUT -p tcp --dport 8443 -j ACCEPT",             check=False)
-        adb_shell("iptables -I INPUT -p tcp --dport 8080 -j ACCEPT",             check=False)
-        adb_shell("iptables -t nat -F PREROUTING",                               check=False)
-        adb_shell("echo 1 > /proc/sys/net/ipv4/ip_forward",                     check=False)
-        adb_shell("iptables -t nat -A POSTROUTING -o rmnet_data0 -j MASQUERADE", check=False)
-        adb_shell("iptables -A FORWARD -i bridge0 -o rmnet_data0 -j ACCEPT",     check=False)
-        adb_shell("iptables -A FORWARD -i rmnet_data0 -o bridge0 -m state --state RELATED,ESTABLISHED -j ACCEPT", check=False)
-
-    # ── Boot persistence via adb shell (works because ADB is root) ───────
-    if is_root:
-        print()
-        print("  Setting up boot persistence (USB composition hook)…")
-        adb_shell(f"sed -i '/dagshell_boot.sh/d' /data/dnsmasq.conf",          check=False)
-        adb_shell(f"rm -f {USB_WRAPPER_PATH}",                                  check=False)
-        adb_shell(f"echo '#!/bin/sh' > {USB_WRAPPER_PATH}",                    check=False)
-        adb_shell(f"echo '# DagShell USB boot wrapper' >> {USB_WRAPPER_PATH}", check=False)
-        adb_shell(f"echo 'sh {REMOTE_BOOT} &' >> {USB_WRAPPER_PATH}",          check=False)
-        adb_shell(f"echo '{USB_ORIGINAL} \"$@\"' >> {USB_WRAPPER_PATH}",       check=False)
-        adb_shell(f"chmod +x {USB_WRAPPER_PATH}",                              check=False)
-        print("  Boot hook installed.")
-
-    # ── Start the app — survive ADB session disconnect ─────────────────
-    #
-    # Android cgroups kill the entire ADB shell process group when the
-    # connection drops — setsid/nohup alone are not enough.
-    #
-    # Strategy:
-    #  1. Run dagshell_boot.sh via setsid to set up iptables/NAT and start
-    #     the netcat shell listener on port 24 (those may survive briefly).
-    #  2. Forward port 24 locally and send the orbic_app start command
-    #     through that shell, which lives in init's cgroup rather than the
-    #     ADB cgroup → survives after our ADB session ends.
-    #  3. Fall back to a direct setsid launch if nc isn't up yet.
-    print()
-    print("  Running dagshell_boot.sh (sets up iptables / NAT / nc listener)…")
-    adb_shell(f"setsid sh {REMOTE_BOOT} </dev/null >/dev/null 2>&1 &", check=False)
-    # Give the boot script time to start the nc listener (it has sleep 5
-    # before launching orbic_app, but nc starts earlier).
-    time.sleep(8)
-
-    # Try to launch orbic_app through the nc shell on port 24.
-    launched_via_nc = False
-    try:
-        print("  Forwarding port 24 (nc shell) to launch orbic_app from init context…")
-        subprocess.run(
-            ["adb", "forward", "tcp:12024", "tcp:24"],
-            capture_output=True, timeout=10,
-        )
-        time.sleep(1)
-        import socket
-        with socket.create_connection(("127.0.0.1", 12024), timeout=5) as s:
-            cmd = (
-                f"pkill -f orbic_app 2>/dev/null; sleep 1; "
-                f"{REMOTE_FILE} >/data/orbic_app.log 2>&1 &\n"
-            )
-            s.sendall(cmd.encode())
-            time.sleep(3)
-        launched_via_nc = True
-        print("  orbic_app start command sent via init-context nc shell.")
-    except Exception as exc:
-        print(f"  [!] nc shell launch failed ({exc}) — falling back to setsid direct launch…")
-        adb_shell(
-            f"pkill -f orbic_app 2>/dev/null; sleep 1; "
-            f"setsid {REMOTE_FILE} </dev/null >/data/orbic_app.log 2>&1 &",
-            check=False,
-        )
-        time.sleep(3)
-
-    # Verify the process is alive
-    ps_out = adb_shell("pgrep -f orbic_app 2>/dev/null", check=False).strip()
-    if ps_out:
-        print(f"  [✓] orbic_app running (PID {ps_out})")
-    else:
-        print("  [!] orbic_app did not start — check /data/boot_diag.log or /data/orbic_app.log")
-
-
-def install_via_at(at_dev, has_ssl: bool, ssl_root: Path) -> None:
-    """
-    Install DagShell via AT+SYSCMD over the USB serial interface (root via
-    atfwd_daemon). May raise ATDeviceLost if the device drops mid-install, in
-    which case the caller should fall back to install_via_adb_shell().
-    """
-    print("  [✓] AT interface open — running privileged commands via AT+SYSCMD")
-    print()
-    print("  Moving files to /data/ …")
-    at_cmd(at_dev, f"mv {REMOTE_TMP_APP}  {REMOTE_FILE}")
-    at_cmd(at_dev, f"mv {REMOTE_TMP_BOOT} {REMOTE_BOOT}")
-    at_cmd(at_dev, f"chmod +x {REMOTE_FILE}")
-    at_cmd(at_dev, f"chmod +x {REMOTE_BOOT}")
-
-    if has_ssl:
-        print("  Installing SSL certificates…")
-        at_cmd(at_dev, "mv /tmp/server.der     /data/server.der")
-        at_cmd(at_dev, "mv /tmp/server.key.der /data/server.key.der")
-        at_cmd(at_dev, "chmod 600 /data/server.key.der")
-        if ssl_root.exists():
-            at_cmd(at_dev, "mv /tmp/root.der /data/root.der")
-
-    print()
-    print("  Configuring network…")
-    at_cmd(at_dev, "iptables -I INPUT -p tcp --dport 8443 -j ACCEPT")
-    at_cmd(at_dev, "iptables -I INPUT -p tcp --dport 8080 -j ACCEPT")
-    at_cmd(at_dev, "iptables -t nat -F PREROUTING")
-    at_cmd(at_dev, "echo 1 > /proc/sys/net/ipv4/ip_forward")
-    at_cmd(at_dev, "iptables -t nat -A POSTROUTING -o rmnet_data0 -j MASQUERADE")
-    at_cmd(at_dev, "iptables -A FORWARD -i bridge0 -o rmnet_data0 -j ACCEPT")
-    at_cmd(at_dev, "iptables -A FORWARD -i rmnet_data0 -o bridge0 -m state --state RELATED,ESTABLISHED -j ACCEPT")
-
-    print()
-    setup_autostart(at_dev)
-
-    print()
-    print("  Starting orbic_app…")
-    at_cmd(at_dev, f"{REMOTE_FILE} &")
-
-
-# =============================================================================
 # Main deployment flow
 # =============================================================================
 
@@ -827,12 +836,13 @@ def deploy() -> None:
 
     banner = "=" * 58
     print(banner)
-    print("  DagShell USB Deployer")
+    print("  DagShell USB Deployer  v2.0")
     print("  (Rayhunter orbic-usb method — USB cable, no WiFi needed)")
+    print("  Root gain: AT+SYSCMD → rootshell SUID → privileged ops")
     print(banner)
 
     # ── Step 1: prerequisites ─────────────────────────────────────────────────
-    print("\n[1/7] Checking prerequisites…")
+    print("\n[1/8] Checking prerequisites…")
 
     if not check_adb():
         print("  [✗] 'adb' not found in PATH. Install Android Debug Bridge:")
@@ -860,8 +870,18 @@ def deploy() -> None:
         sys.exit(1)
     print(f"  [✓] Boot script: {BOOT_SCRIPT_PATH.name}")
 
+    if not ROOTSHELL_PATH.exists():
+        print(f"  [✗] rootshell binary not found: {ROOTSHELL_PATH}")
+        print("      Build it:  cd orbic_fw_c && "
+              "arm-cortex_a8-linux-gnueabi-as -meabi=5 -o rootshell.o rootshell.S && "
+              "arm-cortex_a8-linux-gnueabi-ld -o rootshell rootshell.o && "
+              "arm-cortex_a8-linux-gnueabi-strip rootshell")
+        sys.exit(1)
+    rs_size = ROOTSHELL_PATH.stat().st_size
+    print(f"  [✓] rootshell: {ROOTSHELL_PATH.name}  ({rs_size} bytes)")
+
     # ── Step 2: detect device ─────────────────────────────────────────────────
-    print("\n[2/7] Detecting Orbic device…")
+    print("\n[2/8] Detecting Orbic device…")
 
     if HAS_PYUSB:
         dev_obj, cur_pid = find_orbic()
@@ -880,7 +900,7 @@ def deploy() -> None:
         print("  (pyusb unavailable — skipping USB detection)")
 
     # ── Step 3: mode switch ───────────────────────────────────────────────────
-    print("\n[3/7] Switching to ADB mode…")
+    print("\n[3/8] Switching to ADB mode…")
 
     need_reboot = False
     if HAS_PYUSB and cur_pid != PRODUCT_ID_ADB:
@@ -900,7 +920,7 @@ def deploy() -> None:
         time.sleep(wait_secs)
 
     # ── Step 4: wait for ADB ──────────────────────────────────────────────────
-    print("\n[4/7] Waiting for ADB device…")
+    print("\n[4/8] Waiting for ADB device…")
     if not wait_for_adb(timeout_sec=90):
         print("  [✗] ADB device not detected after 90 seconds.")
         print("  Troubleshooting:\n"
@@ -910,21 +930,19 @@ def deploy() -> None:
         sys.exit(1)
 
     # ── Step 5: prepare device ────────────────────────────────────────────────
-    print("\n[5/7] Preparing device…")
+    print("\n[5/8] Preparing device…")
     print("  Stopping any running orbic_app…")
     adb_shell("pkill -f orbic_app 2>/dev/null; true", check=False)
     print("  Ensuring /tmp is writable…")
     adb_shell("mkdir -p /tmp", check=False)
     time.sleep(1)
 
-    # ── Step 6: push files via adb ────────────────────────────────────────────
-    print("\n[6/7] Pushing files to device via ADB…")
+    # ── Step 6: push files via ADB ────────────────────────────────────────────
+    print("\n[6/8] Pushing files to device via ADB…")
 
-    # Push firmware to /tmp/ — ADB shell user can always write here
     adb_push(str(FIRMWARE_PATH), REMOTE_TMP_APP)
-
-    # Push boot script
     adb_push(str(BOOT_SCRIPT_PATH), REMOTE_TMP_BOOT)
+    adb_push(str(ROOTSHELL_PATH), REMOTE_TMP_ROOTSHELL)
 
     # Push SSL certs if they exist
     ssl_cert = FIRMWARE_DIR / "server.der"
@@ -944,51 +962,113 @@ def deploy() -> None:
 
     print("  All files pushed to /tmp/")
 
-    # ── Step 7: install via AT+SYSCMD ─────────────────────────────────────────
-    print("\n[7/7] Installing — AT+SYSCMD root operations…")
+    # ── Step 7: install rootshell ─────────────────────────────────────────────
+    print("\n[7/8] Installing rootshell (SUID root escalation)…")
 
-    # Open the USB serial interface to talk to atfwd_daemon (runs as root)
-    print("  Opening USB AT command interface (interface 1)…")
-    at_dev = open_at_interface()
+    # Check if rootshell is already installed (Rayhunter-first device)
+    rootshell_ready = check_rootshell_exists()
 
-    # After a USB mode switch + reboot the device often needs extra time before
-    # atfwd_daemon will answer. Pause, then health-check the AT interface so we
-    # don't fire a wall of commands at a half-booted device (which produced the
-    # "Operation timed out" / "No such device" failures previously).
-    if at_dev is not None:
-        if need_reboot:
-            print(f"  Letting device settle for {USB_STABILIZE_SEC}s after reboot…")
-            time.sleep(USB_STABILIZE_SEC)
-        if not at_health_check(at_dev):
-            print("  [!] AT interface not responsive — switching to ADB shell fallback.")
-            release_at_interface(at_dev)
-            try:
-                subprocess.run(["adb", "start-server"], capture_output=True, timeout=10)
-            except Exception:
-                pass
-            at_dev = None
-
-    if at_dev is None:
-        # ─── Fallback: ADB shell (no usable AT interface) ─────────────────────
-        print("  [!] Using ADB shell install path.")
-        install_via_adb_shell(has_ssl, ssl_root)
+    if rootshell_ready:
+        print("  [✓] rootshell already installed and functional (Rayhunter compatible)")
+        print("      Skipping AT+SYSCMD rootshell install.")
     else:
-        # ─── Primary: AT+SYSCMD, with automatic ADB fallback on mid-run drop ──
-        try:
-            install_via_at(at_dev, has_ssl, ssl_root)
-        except ATDeviceLost as exc:
-            print(f"  [!] AT interface dropped mid-install ({exc}).")
-            print("  Restarting ADB and finishing via ADB shell fallback…")
-            release_at_interface(at_dev)
-            at_dev = None
-            try:
-                subprocess.run(["adb", "start-server"], capture_output=True, timeout=10)
-            except Exception:
-                pass
-            install_via_adb_shell(has_ssl, ssl_root)
-        finally:
+        print("  rootshell not found — installing via AT+SYSCMD…")
+
+        # Also check if ADB shell is already root (no rootshell needed)
+        uid_line = adb_shell("id", check=False).split("\n")[0].strip()
+        is_adb_root = "uid=0" in uid_line
+        print(f"  ADB shell identity: {uid_line or '(unknown)'}")
+
+        if is_adb_root:
+            print("  [✓] ADB shell is root — installing rootshell directly.")
+            adb_shell(f"cp {REMOTE_TMP_ROOTSHELL} {REMOTE_ROOTSHELL}", check=False)
+            adb_shell(f"chown root:root {REMOTE_ROOTSHELL}", check=False)
+            adb_shell(f"chmod 4755 {REMOTE_ROOTSHELL}", check=False)
+            rootshell_ready = check_rootshell_exists()
+            if rootshell_ready:
+                print("  [✓] rootshell installed via root ADB shell.")
+            else:
+                print("  [!] rootshell install via ADB failed — will use direct root ADB path.")
+        else:
+            # Fresh device, non-root ADB: must use AT+SYSCMD
+            print("  ADB shell is NOT root — using AT+SYSCMD for rootshell install.")
+            print("  Opening USB AT command interface (interface 1)…")
+            at_dev = open_at_interface()
+
             if at_dev is not None:
-                release_at_interface(at_dev)
+                if need_reboot:
+                    print(f"  Letting device settle for {USB_STABILIZE_SEC}s after reboot…")
+                    time.sleep(USB_STABILIZE_SEC)
+
+                if at_health_check(at_dev):
+                    try:
+                        rootshell_ready = install_rootshell_via_at(at_dev)
+                        at_dev = None  # released inside install_rootshell_via_at
+                    except ATDeviceLost as exc:
+                        print(f"  [!] AT interface dropped during rootshell install ({exc}).")
+                        release_at_interface(at_dev)
+                        at_dev = None
+                else:
+                    print("  [!] AT interface not responsive.")
+                    release_at_interface(at_dev)
+                    at_dev = None
+            else:
+                print("  [!] Could not open AT interface.")
+
+            if not rootshell_ready:
+                print()
+                print("  [✗] FATAL: Cannot gain root on this device.")
+                print("      rootshell install via AT+SYSCMD failed and ADB shell is not root.")
+                print()
+                print("      Troubleshooting:")
+                print("        • Ensure the USB cable supports data (not charge-only)")
+                print("        • Try:  sudo python3 deploy_usb.py  (for USB permissions)")
+                print("        • Install Rayhunter first (provides rootshell)")
+                sys.exit(1)
+
+    # ── Step 8: install DagShell ──────────────────────────────────────────────
+    print("\n[8/8] Installing DagShell…")
+
+    # Ensure ADB is ready
+    if not wait_for_adb(timeout_sec=30):
+        print("  [✗] ADB did not reconnect.")
+        sys.exit(1)
+
+    # Check which install path to use
+    uid_line = adb_shell("id", check=False).split("\n")[0].strip()
+    is_adb_root = "uid=0" in uid_line
+
+    if rootshell_ready:
+        # Primary path: rootshell for all privileged ops
+        install_via_rootshell(has_ssl, ssl_root)
+    elif is_adb_root:
+        # Fallback: ADB shell is root (Rayhunter-first device without rootshell)
+        install_via_adb_root(has_ssl, ssl_root)
+    else:
+        # Should never reach here — caught in step 7
+        print("  [✗] No root access available.")
+        sys.exit(1)
+
+    # ── Reboot device to activate boot hook ───────────────────────────────────
+    print()
+    print("  Rebooting device to activate boot hook…")
+    print("  (dagshell_boot.sh will apply iptables + start orbic_app on boot)")
+    adb_shell("reboot", check=False)
+
+    # Wait for reboot cycle
+    print("  Waiting 30s for reboot…", end="", flush=True)
+    time.sleep(30)
+    print(" done.")
+
+    # Reconnect ADB after reboot
+    if not wait_for_adb(timeout_sec=90):
+        print("  [!] ADB did not reconnect after reboot.")
+        print("      The device may need more time. Try:")
+        print("        python3 deploy_usb.py --verify-only")
+    else:
+        # Wait for boot script to finish (has sleep 5 + startup time)
+        print("  Waiting 15s for dagshell_boot.sh to complete…")
+        time.sleep(15)
 
     # ── Done ──────────────────────────────────────────────────────────────────
     print()
@@ -997,6 +1077,7 @@ def deploy() -> None:
     print(banner)
     print(f"  Firmware   : {REMOTE_FILE}")
     print(f"  Boot hook  : {REMOTE_BOOT}  →  {USB_WRAPPER_PATH}")
+    print(f"  rootshell  : {REMOTE_ROOTSHELL}  (SUID root)")
     if has_ssl:
         print("  Web UI     : https://192.168.1.1:8443/")
         print("  (Connect to device WiFi, then open the URL in your browser.)")
@@ -1006,7 +1087,12 @@ def deploy() -> None:
     print(banner)
 
     # ── Verify ────────────────────────────────────────────────────────────────
-    verify_deployment()
+    if adb_devices():
+        verify_deployment()
+    else:
+        print()
+        print("  [!] ADB not available for verification.")
+        print("      Once device boots, run:  python3 deploy_usb.py --verify-only")
 
 
 if __name__ == "__main__":
