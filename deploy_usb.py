@@ -54,6 +54,19 @@ import sys
 import time
 from pathlib import Path
 
+# Cryptography for fresh PKI cert generation each deploy
+try:
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.backends import default_backend
+    import datetime
+    import ipaddress
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
+
 # Optional pyusb for USB mode switching and AT+SYSCMD
 # We also probe for a working libusb backend at import time so that a
 # missing native library (e.g. libusb not installed via brew/apt) degrades
@@ -135,6 +148,116 @@ BOOT_HOOK_CONTENT = f"""#!/bin/sh
 sh {REMOTE_BOOT} &
 {USB_ORIGINAL} "$@"
 """
+
+
+# =============================================================================
+# SSL Certificate Generation (fresh certs every deploy)
+# =============================================================================
+
+def generate_fresh_certs(output_dir: Path) -> bool:
+    """
+    Generate a fresh 2-tier PKI (Root CA → Leaf) for each deployment.
+    Produces DER-encoded files compatible with BearSSL on the device:
+      - root.der        : Root CA certificate (install on client for trust)
+      - server.der      : Leaf/server certificate (SAN: 192.168.1.1, localhost)
+      - server.key.der  : Leaf private key (PKCS#1 / TraditionalOpenSSL DER)
+
+    Fresh certs on every deploy ensure:
+      - No stale/expired certificates from previous installs
+      - Each device gets a unique keypair
+      - No accidental key reuse across devices
+    """
+    if not HAS_CRYPTO:
+        print("  [!] 'cryptography' package not installed — cannot generate certs.")
+        print("      Install with: pip install cryptography")
+        print("      Or run manually: python3 orbic_fw_c/gen_pki.py")
+        return False
+
+    print("  Generating fresh SSL certificates…")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Root CA ---
+    root_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    root_subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "DagShell Root CA"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "DagShell"),
+    ])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    root_cert = (
+        x509.CertificateBuilder()
+        .subject_name(root_subject)
+        .issuer_name(root_subject)
+        .public_key(root_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=None), critical=True,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True, key_cert_sign=True, crl_sign=True,
+                content_commitment=False, key_encipherment=False,
+                data_encipherment=False, key_agreement=False,
+                encipher_only=False, decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(root_key, hashes.SHA256(), default_backend())
+    )
+
+    # --- Leaf / Server Certificate ---
+    server_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    server_subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "192.168.1.1"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "DagShell"),
+    ])
+    server_cert = (
+        x509.CertificateBuilder()
+        .subject_name(server_subject)
+        .issuer_name(root_subject)
+        .public_key(server_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None), critical=True,
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([
+                x509.IPAddress(ipaddress.ip_address("192.168.1.1")),
+                x509.DNSName("localhost"),
+            ]),
+            critical=False,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+            critical=False,
+        )
+        .sign(root_key, hashes.SHA256(), default_backend())
+    )
+
+    # --- Write DER files ---
+    root_path = output_dir / "root.der"
+    cert_path = output_dir / "server.der"
+    key_path  = output_dir / "server.key.der"
+
+    root_path.write_bytes(root_cert.public_bytes(serialization.Encoding.DER))
+    cert_path.write_bytes(server_cert.public_bytes(serialization.Encoding.DER))
+    key_path.write_bytes(server_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+
+    print(f"  [✓] root.der        ({root_path.stat().st_size} bytes)")
+    print(f"  [✓] server.der      ({cert_path.stat().st_size} bytes)")
+    print(f"  [✓] server.key.der  ({key_path.stat().st_size} bytes)")
+    return True
 
 
 # =============================================================================
@@ -944,11 +1067,12 @@ def deploy() -> None:
     adb_push(str(BOOT_SCRIPT_PATH), REMOTE_TMP_BOOT)
     adb_push(str(ROOTSHELL_PATH), REMOTE_TMP_ROOTSHELL)
 
-    # Push SSL certs if they exist
+    # Generate fresh SSL certificates for this deployment
     ssl_cert = FIRMWARE_DIR / "server.der"
     ssl_key  = FIRMWARE_DIR / "server.key.der"
     ssl_root = FIRMWARE_DIR / "root.der"
-    has_ssl  = ssl_cert.exists() and ssl_key.exists()
+
+    has_ssl = generate_fresh_certs(FIRMWARE_DIR)
 
     if has_ssl:
         print("  Pushing SSL certificates…")
@@ -957,8 +1081,8 @@ def deploy() -> None:
         if ssl_root.exists():
             adb_push(str(ssl_root), "/tmp/root.der")
     else:
-        print("  [!] SSL certs not found — HTTPS will not be available.")
-        print("      Run  python3 orbic_fw_c/gen_pki.py  first.")
+        print("  [!] SSL cert generation failed — HTTPS will not be available.")
+        print("      Install cryptography: pip install cryptography")
 
     print("  All files pushed to /tmp/")
 
@@ -1094,6 +1218,15 @@ def deploy() -> None:
         print("  [!] ADB not available for verification.")
         print("      Once device boots, run:  python3 deploy_usb.py --verify-only")
 
+    # ── Cleanup: kill ADB server on exit ──────────────────────────────────────
+    print()
+    print("  Stopping ADB server…")
+    try:
+        subprocess.run(["adb", "kill-server"], capture_output=True, timeout=8)
+        print("  [✓] ADB server stopped.")
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     import argparse
@@ -1118,6 +1251,14 @@ if __name__ == "__main__":
             print("  [✗] No ADB device connected.")
             sys.exit(1)
         ok = verify_deployment()
+        # Kill ADB server on exit
+        print()
+        print("  Stopping ADB server…")
+        try:
+            subprocess.run(["adb", "kill-server"], capture_output=True, timeout=8)
+            print("  [✓] ADB server stopped.")
+        except Exception:
+            pass
         sys.exit(0 if ok else 1)
     else:
         deploy()
