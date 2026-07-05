@@ -826,16 +826,19 @@ def install_via_adb_root(has_ssl: bool, ssl_root: Path) -> None:
 
 def verify_deployment() -> bool:
     """
-    Prove DagShell is running via ADB — no WiFi required.
+    Prove DagShell is running via ADB port forwarding + host-side curl.
 
-    Rayhunter's equivalent (installer/src/orbic.rs test_rayhunter()):
-      adb_command(device, &["wget", "-O", "-", "http://localhost:8080/index.html"])
-
-    We do the same for DagShell on port 8443 (HTTPS) plus extra port / log checks.
+    The device's busybox wget has NO TLS support, so we can't test HTTPS
+    from on-device. Instead we:
+      1. Check process is alive (adb shell pgrep)
+      2. Check port 8443 is listening (adb shell /proc/net/tcp)
+      3. Set up ADB port forwarding (adb forward tcp:18443 tcp:8443)
+      4. Use host-side curl -k to make a REAL TLS connection
+      5. Verify we get actual HTML back from the DagShell web UI
+      6. Remove ADB port forwarding when done
     """
     print("\n" + "=" * 58)
-    print("  Verifying deployment (via ADB — no WiFi needed)")
-    print("  (Mirrors Rayhunter test_rayhunter() concept)")
+    print("  Verifying deployment (ADB port-forward + host TLS)")
     print("=" * 58)
 
     all_ok = True
@@ -849,87 +852,133 @@ def verify_deployment() -> bool:
         all_ok = False
 
     # ── Check 2: port 8443 listening ──────────────────────────────────────────
-    print("  Waiting 10s for orbic_app to bind port 8443…", end="", flush=True)
-    time.sleep(10)
+    print("  Waiting 8s for orbic_app to bind port 8443…", end="", flush=True)
+    time.sleep(8)
     print(" done.")
 
     port_open = False
 
-    ns = adb_shell("netstat -tlnp 2>/dev/null | grep ':8443'", check=False).strip()
-    if ns:
-        print(f"  [✓] Port 8443 : LISTENING  ({ns.split()[0]})")
-        port_open = True
+    # Check /proc/net/tcp for port 8443 (hex 20FB) in LISTEN state (0A)
+    for tcp_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        entry = adb_shell(
+            f"cat {tcp_file} 2>/dev/null | awk '$2 ~ /:20FB$/ && $4 == \"0A\"'",
+            check=False,
+        ).strip()
+        if entry:
+            print(f"  [✓] Port 8443 : LISTENING  ({tcp_file})")
+            port_open = True
+            break
 
     if not port_open:
-        nc_out = adb_shell("nc -z 127.0.0.1 8443 2>&1; echo rc=$?", check=False).strip()
-        if "rc=0" in nc_out:
-            print("  [✓] Port 8443 : REACHABLE  (nc -z probe)")
+        # Fallback: netstat
+        ns = adb_shell("netstat -tlnp 2>/dev/null | grep ':8443'", check=False).strip()
+        if ns:
+            print(f"  [✓] Port 8443 : LISTENING  (netstat)")
             port_open = True
 
     if not port_open:
-        for tcp_file in ("/proc/net/tcp6", "/proc/net/tcp"):
-            entry = adb_shell(
-                f"grep -i ' 20FB' {tcp_file} 2>/dev/null | head -1", check=False
-            ).strip()
-            if entry:
-                print(f"  [✓] Port 8443 : LISTENING  ({tcp_file})")
-                port_open = True
-                break
+        # Fallback: nc probe
+        nc_out = adb_shell("nc -z 127.0.0.1 8443 2>&1; echo rc=$?", check=False).strip()
+        if "rc=0" in nc_out:
+            print("  [✓] Port 8443 : REACHABLE  (nc probe)")
+            port_open = True
 
     if not port_open:
-        print("  [!] Port 8443 : not yet visible — will confirm via TLS probe below")
+        print("  [✗] Port 8443 : NOT listening after 8s")
+        all_ok = False
 
-    # ── Check 3: TLS probe ────────────────────────────────────────────────────
-    MAX_ATTEMPTS = 5
+    # ── Check 3: cert files on device ─────────────────────────────────────────
+    cert_check = adb_shell(
+        "ls -la /data/server.der /data/server.key.der /data/root.der 2>&1",
+        check=False,
+    ).strip()
+    cert_files_ok = (
+        "server.der" in cert_check
+        and "server.key.der" in cert_check
+        and "No such file" not in cert_check
+    )
+    if cert_files_ok:
+        print("  [✓] SSL certs : present on device (/data/*.der)")
+    else:
+        print("  [✗] SSL certs : MISSING from /data/")
+        print(f"      {cert_check}")
+        all_ok = False
+
+    # ── Check 4: real TLS probe via ADB port forwarding ───────────────────────
     web_ok = False
-    print(f"  Probing https://127.0.0.1:8443/ via adb shell ({MAX_ATTEMPTS} attempts)…")
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        raw = adb_shell(
-            "wget -q -O - --no-check-certificate https://127.0.0.1:8443/ 2>&1 | head -5",
-            check=False,
-        ).strip()
+    if port_open:
+        # Set up ADB port forwarding: host:18443 → device:8443
+        LOCAL_PORT = 18443
+        print(f"  Setting up ADB port forward (localhost:{LOCAL_PORT} → device:8443)…")
+        try:
+            adb(["forward", f"tcp:{LOCAL_PORT}", "tcp:8443"], check=True, timeout=10)
+        except Exception as exc:
+            print(f"  [!] ADB forward failed: {exc}")
+            LOCAL_PORT = 0
 
-        raw_lower = raw.lower()
+        if LOCAL_PORT:
+            MAX_ATTEMPTS = 5
+            print(f"  Probing https://localhost:{LOCAL_PORT}/ with host curl ({MAX_ATTEMPTS} attempts)…")
 
-        if raw and any(kw in raw_lower for kw in ("html", "dagshell", "<!doctype", "<html")):
-            print(f"  [✓] Web server: HTML response received  (attempt {attempt})")
-            web_ok = True
-            break
-        elif raw and any(kw in raw_lower for kw in ("ssl", "tls", "handshake", "certificate")):
-            print(f"  [✓] Web server: TLS handshake confirmed — server is up  (attempt {attempt})")
-            web_ok = True
-            break
-        elif raw and any(kw in raw_lower for kw in ("connection reset", "reset by peer", "peer reset")):
-            print(f"  [✓] Web server: TCP+TLS confirmed (reset by peer = BearSSL active, "
-                  f"attempt {attempt})")
-            web_ok = True
-            break
-        elif "connection refused" in raw_lower:
-            print(f"  [!] Attempt {attempt}/{MAX_ATTEMPTS}: connection refused — "
-                  "server not listening yet")
-        elif raw:
-            print(f"  [?] Attempt {attempt}/{MAX_ATTEMPTS}: {raw[:120]}")
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                try:
+                    result = subprocess.run(
+                        ["curl", "-sk", "--connect-timeout", "5", "--max-time", "10",
+                         f"https://localhost:{LOCAL_PORT}/"],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    body = result.stdout.strip()
+                    body_lower = body.lower()
 
-        if attempt < MAX_ATTEMPTS:
-            time.sleep(3)
+                    if body and any(kw in body_lower for kw in (
+                        "<html", "<!doctype", "dagshell", "orbic"
+                    )):
+                        # Show a snippet of the HTML
+                        snippet = body[:200].replace('\n', ' ')
+                        print(f"  [✓] Web server : HTML received!  (attempt {attempt})")
+                        print(f"      Preview: {snippet[:120]}…")
+                        web_ok = True
+                        break
+                    elif body:
+                        print(f"  [?] Attempt {attempt}/{MAX_ATTEMPTS}: got response but no HTML marker")
+                        print(f"      Body: {body[:120]}")
+                    else:
+                        stderr = result.stderr.strip().lower()
+                        if "connection refused" in stderr:
+                            print(f"  [!] Attempt {attempt}/{MAX_ATTEMPTS}: connection refused")
+                        elif "reset" in stderr:
+                            print(f"  [!] Attempt {attempt}/{MAX_ATTEMPTS}: connection reset — TLS handshake failed")
+                        elif stderr:
+                            print(f"  [!] Attempt {attempt}/{MAX_ATTEMPTS}: {result.stderr.strip()[:120]}")
+                        else:
+                            print(f"  [!] Attempt {attempt}/{MAX_ATTEMPTS}: empty response")
 
-    if not web_ok and port_open:
-        print("  [✓] Web server: port 8443 is open — server IS running")
-        web_ok = True
+                except subprocess.TimeoutExpired:
+                    print(f"  [!] Attempt {attempt}/{MAX_ATTEMPTS}: timeout")
+                except FileNotFoundError:
+                    print("  [!] curl not found — install curl to enable TLS verification")
+                    break
 
-    if web_ok and not port_open:
-        print("  [✓] Port 8443 : confirmed reachable (TLS response received)")
-        port_open = True
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(3)
 
-    if not web_ok:
-        print("  [✗] Web server: no response after all attempts")
+            # Clean up port forwarding
+            try:
+                adb(["forward", "--remove", f"tcp:{LOCAL_PORT}"], check=False, timeout=5)
+            except Exception:
+                pass
+
+    if not web_ok and port_open and cert_files_ok:
+        print("  [✗] Web server : TLS handshake FAILED — BearSSL could not serve content")
+        print("      The app is running and port is open but HTTPS is broken.")
+        print("      Check /data/server.der + server.key.der are valid DER certs.")
+        all_ok = False
+    elif not web_ok:
+        print("  [✗] Web server : could not verify (port not open or certs missing)")
         all_ok = False
 
-    if not port_open:
-        all_ok = False
-
-    # ── Check 4: boot log ─────────────────────────────────────────────────────
+    # ── Check 5: boot log ─────────────────────────────────────────────────────
     boot_log = adb_shell("tail -15 /data/boot_diag.log 2>/dev/null", check=False).strip()
     if boot_log:
         print()
@@ -940,13 +989,16 @@ def verify_deployment() -> bool:
     # ── Summary ───────────────────────────────────────────────────────────────
     print()
     if all_ok:
-        print("  [✓] All checks passed — DagShell is live!")
-        print("  Connect to the device WiFi and open: https://192.168.1.1:8443/")
+        print("  ╔══════════════════════════════════════════════════════╗")
+        print("  ║  [✓] ALL CHECKS PASSED — DagShell is LIVE!         ║")
+        print("  ║  Connect to device WiFi → https://192.168.1.1:8443 ║")
+        print("  ╚══════════════════════════════════════════════════════╝")
     else:
-        print("  [!] One or more checks failed.")
-        print("  The app may need a few more seconds.  Tips:")
-        print("    • Wait 10s and re-run:  python3 deploy_usb.py --verify-only")
-        print("    • Check the boot log above for errors")
+        print("  [✗] One or more checks FAILED.")
+        print("  Troubleshooting:")
+        print("    • Wait 15s and re-run:  python3 deploy_usb.py --verify-only")
+        print("    • Check orbic_app stderr:  adb shell '/data/orbic_app </dev/null 2>&1'")
+        print("    • Check boot log above for errors")
     print("=" * 58)
     return all_ok
 
