@@ -886,16 +886,27 @@ def verify_deployment() -> bool:
     if not port_open:
         print(f" — NOT listening after {PORT_TIMEOUT}s!")
         print("  [✗] Port 8443 : NOT listening")
-        # Grab orbic_app stderr to diagnose WHY
-        print("  Checking orbic_app output for errors…")
+        # Grab orbic_app stderr — kill the running instance, restart
+        # briefly to capture startup errors, then leave it running.
+        print("  Restarting orbic_app to capture startup errors…")
+        adb_shell("pkill -f orbic_app 2>/dev/null; sleep 1", check=False)
         app_err = adb_shell(
-            "timeout 3 /data/orbic_app </dev/null 2>&1 || true",
+            "sh -c '/data/orbic_app </dev/null >/tmp/orbic_diag.log 2>&1 &"
+            " sleep 5; cat /tmp/orbic_diag.log'",
             check=False,
         ).strip()
         if app_err:
-            print("  orbic_app output:")
-            for line in app_err.splitlines()[:10]:
+            print("  orbic_app startup output:")
+            for line in app_err.splitlines()[:15]:
                 print(f"    {line}")
+        else:
+            print("  orbic_app produced no output (may have crashed silently)")
+            # Check if process survived
+            alive = adb_shell("pgrep -f orbic_app 2>/dev/null", check=False).strip()
+            if alive:
+                print(f"  Process is still running (PID {alive}) but not binding port")
+            else:
+                print("  [✗] Process CRASHED — not running")
         all_ok = False
 
     # ── Check 3: cert files on device ─────────────────────────────────────────
