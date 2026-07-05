@@ -706,9 +706,8 @@ def install_via_rootshell(has_ssl: bool, ssl_root: Path) -> None:
         print("  rootshell: installing SSL certificates…")
         rootshell_cmd("cp /tmp/server.der /data/server.der")
         rootshell_cmd("cp /tmp/server.key.der /data/server.key.der")
-        rootshell_cmd("chmod 600 /data/server.key.der")
-        if ssl_root.exists():
-            rootshell_cmd("cp /tmp/root.der /data/root.der")
+        rootshell_cmd("cp /tmp/root.der /data/root.der")
+        rootshell_cmd("chmod 644 /data/server.der /data/server.key.der /data/root.der")
 
     # Verify firmware landed
     check_out = rootshell_cmd(f"ls -la {REMOTE_FILE}", check=False)
@@ -783,9 +782,8 @@ def install_via_adb_root(has_ssl: bool, ssl_root: Path) -> None:
         print("  Installing SSL certificates…")
         adb_shell("cp /tmp/server.der     /data/server.der",     check=False)
         adb_shell("cp /tmp/server.key.der /data/server.key.der", check=False)
-        adb_shell("chmod 600 /data/server.key.der",              check=False)
-        if ssl_root.exists():
-            adb_shell("cp /tmp/root.der /data/root.der", check=False)
+        adb_shell("cp /tmp/root.der       /data/root.der",       check=False)
+        adb_shell("chmod 644 /data/server.der /data/server.key.der /data/root.der", check=False)
 
     # Verify firmware landed
     check_out = adb_shell(f"ls -la {REMOTE_FILE} 2>&1", check=False)
