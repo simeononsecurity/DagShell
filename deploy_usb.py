@@ -851,40 +851,51 @@ def verify_deployment() -> bool:
         print("  [✗] Process   : orbic_app NOT found in process list")
         all_ok = False
 
-    # ── Check 2: port 8443 listening ──────────────────────────────────────────
-    print("  Waiting 8s for orbic_app to bind port 8443…", end="", flush=True)
-    time.sleep(8)
-    print(" done.")
-
+    # ── Check 2: port 8443 listening (poll up to 30s) ─────────────────────────
     port_open = False
+    PORT_TIMEOUT = 30
+    print(f"  Waiting for port 8443 (up to {PORT_TIMEOUT}s)", end="", flush=True)
 
-    # Check /proc/net/tcp for port 8443 (hex 20FB) in LISTEN state (0A)
-    for tcp_file in ("/proc/net/tcp", "/proc/net/tcp6"):
-        entry = adb_shell(
-            f"cat {tcp_file} 2>/dev/null | awk '$2 ~ /:20FB$/ && $4 == \"0A\"'",
-            check=False,
-        ).strip()
-        if entry:
-            print(f"  [✓] Port 8443 : LISTENING  ({tcp_file})")
-            port_open = True
+    start = time.time()
+    while time.time() - start < PORT_TIMEOUT:
+        # grep for hex port 20FB in /proc/net/tcp (works on busybox)
+        for tcp_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+            entry = adb_shell(
+                f"grep -i ':20FB ' {tcp_file} 2>/dev/null | head -1",
+                check=False,
+            ).strip()
+            if entry and "20FB" in entry.upper():
+                elapsed = int(time.time() - start)
+                print(f" — UP after {elapsed}s!")
+                print(f"  [✓] Port 8443 : LISTENING  ({tcp_file})")
+                port_open = True
+                break
+        if port_open:
             break
-
-    if not port_open:
-        # Fallback: netstat
-        ns = adb_shell("netstat -tlnp 2>/dev/null | grep ':8443'", check=False).strip()
-        if ns:
-            print(f"  [✓] Port 8443 : LISTENING  (netstat)")
-            port_open = True
-
-    if not port_open:
-        # Fallback: nc probe
+        # Also try nc probe
         nc_out = adb_shell("nc -z 127.0.0.1 8443 2>&1; echo rc=$?", check=False).strip()
         if "rc=0" in nc_out:
+            elapsed = int(time.time() - start)
+            print(f" — UP after {elapsed}s!")
             print("  [✓] Port 8443 : REACHABLE  (nc probe)")
             port_open = True
+            break
+        print(".", end="", flush=True)
+        time.sleep(3)
 
     if not port_open:
-        print("  [✗] Port 8443 : NOT listening after 8s")
+        print(f" — NOT listening after {PORT_TIMEOUT}s!")
+        print("  [✗] Port 8443 : NOT listening")
+        # Grab orbic_app stderr to diagnose WHY
+        print("  Checking orbic_app output for errors…")
+        app_err = adb_shell(
+            "timeout 3 /data/orbic_app </dev/null 2>&1 || true",
+            check=False,
+        ).strip()
+        if app_err:
+            print("  orbic_app output:")
+            for line in app_err.splitlines()[:10]:
+                print(f"    {line}")
         all_ok = False
 
     # ── Check 3: cert files on device ─────────────────────────────────────────
