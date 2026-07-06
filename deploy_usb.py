@@ -1248,7 +1248,7 @@ def deploy() -> None:
     print()
     print("  Rebooting device to activate boot persistence…")
     print("  (dagshell_boot.sh will apply iptables + start orbic_app on boot)")
-    adb_shell("reboot", check=False)
+    rootshell_cmd("reboot")
 
     # Wait for reboot cycle
     print("  Waiting 30s for reboot…", end="", flush=True)
@@ -1263,9 +1263,11 @@ def deploy() -> None:
         print("      The device may need more time. Try:")
         print("        python3 deploy_usb.py --verify-only")
     else:
-        # Give boot script time to start orbic_app (sleep 5 + init)
-        print("  Waiting 15s for dagshell_boot.sh to start orbic_app…")
-        time.sleep(15)
+        # Give boot script time to start orbic_app.
+        # Boot hook fires early in init, dagshell_boot.sh does sleep 5 before
+        # starting orbic_app, plus additional time for BearSSL init + bind.
+        print("  Waiting 25s for dagshell_boot.sh to start orbic_app…")
+        time.sleep(25)
         # Full post-reboot verification (process + port + TLS)
         verify_deployment()
 
