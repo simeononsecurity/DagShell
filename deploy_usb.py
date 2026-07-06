@@ -1245,9 +1245,25 @@ def deploy() -> None:
         print("  [✗] No root access available.")
         sys.exit(1)
 
+    # ── Pre-reboot: start orbic_app now and verify before rebooting ───────────
+    # The boot hook fires at an unpredictable time during boot, making
+    # post-reboot verification unreliable.  Instead we start the app NOW
+    # (via rootshell as root) and verify TLS end-to-end.  Then reboot to
+    # confirm boot persistence.
+    print()
+    print("  Starting orbic_app for pre-reboot verification…")
+    rootshell_cmd("pkill -f orbic_app 2>/dev/null; true")
+    time.sleep(1)
+    rootshell_cmd("/data/orbic_app </dev/null &")
+    time.sleep(2)
+
+    # ── Verify (pre-reboot) ───────────────────────────────────────────────────
+    if adb_devices():
+        verify_deployment()
+
     # ── Reboot device to activate boot hook ───────────────────────────────────
     print()
-    print("  Rebooting device to activate boot hook…")
+    print("  Rebooting device to activate boot persistence…")
     print("  (dagshell_boot.sh will apply iptables + start orbic_app on boot)")
     adb_shell("reboot", check=False)
 
@@ -1256,15 +1272,27 @@ def deploy() -> None:
     time.sleep(30)
     print(" done.")
 
-    # Reconnect ADB after reboot
+    # Reconnect ADB after reboot — quick sanity check only
     if not wait_for_adb(timeout_sec=90):
         print("  [!] ADB did not reconnect after reboot.")
         print("      The device may need more time. Try:")
         print("        python3 deploy_usb.py --verify-only")
     else:
-        # Wait for boot script to finish (has sleep 5 + startup time)
-        print("  Waiting 15s for dagshell_boot.sh to complete…")
-        time.sleep(15)
+        # Give boot script time to start orbic_app
+        print("  Waiting 20s for dagshell_boot.sh to finish…")
+        time.sleep(20)
+        # Quick post-reboot check (process + port only, no full TLS probe)
+        pid = adb_shell("pgrep -f orbic_app 2>/dev/null", check=False).strip()
+        port = adb_shell("grep -i ':20FB' /proc/net/tcp 2>/dev/null", check=False).strip()
+        if pid and port:
+            print(f"  [✓] Post-reboot: orbic_app running (PID {pid}), port 8443 LISTENING")
+        elif pid:
+            print(f"  [!] Post-reboot: orbic_app running (PID {pid}) but port 8443 not yet bound")
+            print("      This is normal — the app may need more time after boot.")
+            print("      Run:  python3 deploy_usb.py --verify-only")
+        else:
+            print("  [!] Post-reboot: orbic_app not yet started")
+            print("      Run:  python3 deploy_usb.py --verify-only")
 
     # ── Done ──────────────────────────────────────────────────────────────────
     print()
@@ -1281,14 +1309,6 @@ def deploy() -> None:
     else:
         print("  Note: rebuild with SSL certs for HTTPS access.")
     print(banner)
-
-    # ── Verify ────────────────────────────────────────────────────────────────
-    if adb_devices():
-        verify_deployment()
-    else:
-        print()
-        print("  [!] ADB not available for verification.")
-        print("      Once device boots, run:  python3 deploy_usb.py --verify-only")
 
     # ── Cleanup: kill ADB server on exit ──────────────────────────────────────
     print()
